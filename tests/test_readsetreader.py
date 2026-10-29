@@ -281,3 +281,169 @@ def test_allele_dection_multi_02():
     expected["Read64"] = [(102, 2), (106, 3)]
     for read in readset:
         assert expected[read.name] == [(v.position, v.allele) for v in read]
+
+
+def realign_reference(variants, restricted_genotypes, j, bam_read, reference, overhang):
+    """The loop of ReadSetReader.detect_alleles_by_alignment over ReadSetReader.realign"""
+    from whatshap._variants import _iterate_cigar
+    from whatshap.variants import ReadSetReader
+
+    cigartuples = bam_read.cigartuples
+    result = []
+    for index, i, consumed, query_pos in _iterate_cigar(variants, j, bam_read, cigartuples):
+        allele, quality = ReadSetReader.realign(
+            variants[index],
+            restricted_genotypes[index] if restricted_genotypes else None,
+            bam_read,
+            cigartuples,
+            i,
+            consumed,
+            query_pos,
+            reference,
+            overhang,
+            False,
+            None,
+            None,
+            None,
+            False,
+            None,
+            7,
+            40,
+            25,
+            None,
+            None,
+        )
+        if allele in range(len(variants[index].get_alt_allele_list()) + 1):
+            result.append((index, allele, quality))
+    return result
+
+
+def random_realignment_case(rng):
+    import pysam
+    from whatshap.vcf import BiallelicVcfVariant, MultiallelicVcfVariant
+
+    bases = "ACGT"
+
+    def seq(n):
+        return "".join(rng.choice(bases) for _ in range(n))
+
+    def other(b):
+        return rng.choice([c for c in bases if c != b])
+
+    reference = seq(300)
+    # short repeats make indels ambiguous
+    for _ in range(4):
+        p = rng.randrange(20, 260)
+        repeat = (seq(rng.choice([1, 2, 3])) * 10)[: rng.randrange(4, 12)]
+        reference = reference[:p] + repeat + reference[p + len(repeat) :]
+    variants = []
+    pos = 15
+    while True:
+        pos += rng.randrange(1, 25)
+        if pos >= 280:
+            break
+        kind = rng.random()
+        if kind < 0.45:
+            variants.append(BiallelicVcfVariant(pos, reference[pos], other(reference[pos])))
+        elif kind < 0.65:
+            variants.append(
+                BiallelicVcfVariant(pos, reference[pos], reference[pos] + seq(rng.randrange(1, 6)))
+            )
+        elif kind < 0.85:
+            variants.append(
+                BiallelicVcfVariant(pos, reference[pos : pos + rng.randrange(2, 7)], reference[pos])
+            )
+        elif kind < 0.95:
+            variants.append(
+                MultiallelicVcfVariant(
+                    pos, reference[pos], [other(reference[pos]), reference[pos] + seq(2)]
+                )
+            )
+        else:
+            variants.append(BiallelicVcfVariant(pos, reference[pos], "<DEL>"))
+    by_position = {v.position: v for v in variants}
+
+    start = rng.randrange(0, 60)
+    end = rng.randrange(240, 300)
+    ops = []  # (operation, reference length, read bases)
+    if rng.random() < 0.3:
+        ops.append(("S", 0, seq(rng.randrange(1, 15))))
+    p = start
+    while p < end:
+        v = by_position.get(p)
+        alt = v.get_alt_allele_list()[0] if v is not None else "<"
+        if v is not None and not alt.startswith("<") and rng.random() < 0.5:
+            r = v.reference_allele
+            if len(r) == 1 and len(alt) == 1:
+                ops.append(("X", 1, alt))
+                p += 1
+            elif len(alt) > len(r):
+                ops.append(("=", 1, r))
+                ops.append(("I", 0, alt[1:]))
+                p += 1
+            else:
+                ops.append(("=", 1, r[0]))
+                ops.append(("D", len(r) - 1, ""))
+                p += len(r)
+            continue
+        e = rng.random()
+        if e < 0.015:
+            ops.append(("X", 1, other(reference[p])))
+            p += 1
+        elif e < 0.025:
+            ops.append(("I", 0, seq(rng.randrange(1, 4))))
+        elif e < 0.035 and p + 3 < end:
+            n = rng.randrange(1, 3)
+            ops.append(("D", n, ""))
+            p += n
+        else:
+            ops.append(("=", 1, reference[p]))
+            p += 1
+    if rng.random() < 0.3:
+        ops.append(("S", 0, seq(rng.randrange(1, 15))))
+    use_m = rng.random() < 0.3
+    cigar = []
+    query = ""
+    for op, n, b in ops:
+        if use_m and op in "=X":
+            op = "M"
+        length = len(b) if op in "SIMX=" else n
+        query += b
+        if cigar and cigar[-1][0] == op:
+            cigar[-1][1] += length
+        else:
+            cigar.append([op, length])
+    bam_read = pysam.AlignedSegment()
+    bam_read.query_name = "read"
+    bam_read.query_sequence = query
+    bam_read.reference_start = start
+    bam_read.cigarstring = "".join(f"{n}{op}" for op, n in cigar)
+    j = 0
+    while j < len(variants) and variants[j].position < start:
+        j += 1
+    return reference, variants, bam_read, j
+
+
+def test_detect_alleles_by_realignment_identical():
+    # The default realignment gives the same alleles as the loop over ReadSetReader.realign
+    import random
+    from whatshap.core import Genotype
+    from whatshap.variants import ReadSetReader
+
+    rng = random.Random(1)
+    observations = 0
+    for case in range(300):
+        reference, variants, bam_read, j = random_realignment_case(rng)
+        restricted = None
+        if case % 3 == 0:
+            restricted = [Genotype([0, len(v.get_alt_allele_list())]) for v in variants]
+        for overhang in (10, 3):
+            expected = realign_reference(variants, restricted, j, bam_read, reference, overhang)
+            detected = list(
+                ReadSetReader.detect_alleles_by_alignment(
+                    variants, restricted, j, bam_read, reference, overhang
+                )
+            )
+            assert detected == expected
+            observations += len(expected)
+    assert observations > 10000

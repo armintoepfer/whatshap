@@ -17,7 +17,7 @@ from .vcf import VcfVariant
 from .bam import SampleBamReader, MultiBamReader, BamReader, AlignmentWithSourceID
 from .core import Genotype, Read, ReadSet, NumericSampleIds
 from .align import edit_distance, edit_distance_affine_gap, kmer_align, enumerate_all_kmers
-from ._variants import _iterate_cigar, _detect_alleles
+from ._variants import _iterate_cigar, _detect_alleles, _detect_alleles_by_realignment
 
 logger = logging.getLogger(__name__)
 
@@ -527,25 +527,42 @@ class ReadSetReader:
                     and normalized_variants[i].position < alignment.bam_alignment.reference_start
                 ):
                     i += 1
-                detected = self.detect_alleles_by_alignment(
-                    variants,
-                    restricted_genotypes,
-                    i,
-                    alignment.bam_alignment,
-                    reference,
-                    self._overhang,
-                    self._use_affine,
-                    self._gap_start,
-                    self._gap_extend,
-                    self._default_mismatch,
-                    self._use_kmerald,
-                    kmerald_costs,
-                    self._kmer_size,
-                    self._kmerald_gappenalty,
-                    self._kmerald_window,
-                    calculated_costs,
-                    splitted_strings,
-                )
+                if not self._use_affine and not self._use_kmerald:
+                    # The default: the same as detect_alleles_by_alignment, but faster
+                    # (accessing cigartuples is expensive, do it only once)
+                    cigartuples = alignment.bam_alignment.cigartuples
+                    if cigartuples:
+                        detected = _detect_alleles_by_realignment(
+                            variants,
+                            restricted_genotypes,
+                            i,
+                            alignment.bam_alignment,
+                            cigartuples,
+                            reference,
+                            self._overhang,
+                        )
+                    else:
+                        detected = []
+                else:
+                    detected = self.detect_alleles_by_alignment(
+                        variants,
+                        restricted_genotypes,
+                        i,
+                        alignment.bam_alignment,
+                        reference,
+                        self._overhang,
+                        self._use_affine,
+                        self._gap_start,
+                        self._gap_extend,
+                        self._default_mismatch,
+                        self._use_kmerald,
+                        kmerald_costs,
+                        self._kmer_size,
+                        self._kmerald_gappenalty,
+                        self._kmerald_window,
+                        calculated_costs,
+                        splitted_strings,
+                    )
 
             for j, allele, quality in detected:
                 read.add_variant(variants[j].position, allele, quality)
@@ -897,6 +914,13 @@ class ReadSetReader:
         # For the same reason, the following check is here instead of
         # in the _usable_alignments method
         if not cigartuples:
+            return
+
+        if not use_affine and not use_kmerald:
+            # The default: the same as the loop below, but faster
+            yield from _detect_alleles_by_realignment(
+                variants, restricted_genotypes, j, bam_read, cigartuples, reference, overhang
+            )
             return
 
         for index, i, consumed, query_pos in _iterate_cigar(variants, j, bam_read, cigartuples):

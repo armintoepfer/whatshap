@@ -3,6 +3,10 @@
 import logging
 from collections import deque
 
+from libcpp.vector cimport vector
+
+from .align import edit_distance
+
 
 logger = logging.getLogger(__name__)
 
@@ -296,3 +300,112 @@ def _detect_alleles_deletion(variant, entry, bam_read, ref_pos, query_pos, lengt
         # If allele has non-deletions left, but did not consume all delete ops -> Fail allele
         if ops_consumed < length and a.progress < a.length:
             a.progress = -1
+
+cdef void _cigar_prefix_length(vector[int]& ops, vector[int]& lengths, int i, int consumed, bint left, int reference_bases, int* result_reference_bases, int* result_query_bases) except *:
+    """
+    ReadSetReader.cigar_prefix_length of the left or right part of the CIGAR, split at
+    operation i after consumed bases (ReadSetReader.split_cigar_left/right).
+    """
+    cdef:
+        int ref_pos = 0
+        int query_pos = 0
+        int k
+        int op
+        int length
+        int n = ops.size()
+        int step
+    if left:
+        k = i if consumed > 0 else i - 1
+        step = -1
+    else:
+        k = i if consumed < lengths[i] else i + 1
+        step = 1
+    while 0 <= k < n:
+        op = ops[k]
+        if k != i:
+            length = lengths[k]
+        elif left:
+            length = consumed
+        else:
+            length = lengths[i] - consumed
+        k += step
+        if op == 0 or op == 7 or op == 8:  # M, X, =
+            ref_pos += length
+            query_pos += length
+            if ref_pos >= reference_bases:
+                result_reference_bases[0] = reference_bases
+                result_query_bases[0] = query_pos + reference_bases - ref_pos
+                return
+        elif op == 2:  # D
+            ref_pos += length
+            if ref_pos >= reference_bases:
+                result_reference_bases[0] = reference_bases
+                result_query_bases[0] = query_pos
+                return
+        elif op == 1:  # I
+            query_pos += length
+        elif op == 4 or op == 5:  # soft or hard clipping
+            pass
+        elif op == 3:  # N
+            # Always stop at reference skips
+            result_reference_bases[0] = reference_bases
+            result_query_bases[0] = query_pos
+            return
+        else:
+            raise AssertionError("unknown CIGAR operator")
+    if not ref_pos < reference_bases:
+        raise AssertionError()
+    result_reference_bases[0] = ref_pos
+    result_query_bases[0] = query_pos
+
+
+def _detect_alleles_by_realignment(variants, restricted_genotypes, int j, bam_read, cigartuples, reference, int overhang):
+    """
+    ReadSetReader.detect_alleles_by_alignment for the default realignment (unit edit
+    distance, no k-mer alignment): the same list of (index, allele, quality).
+    """
+    cdef:
+        vector[int] ops
+        vector[int] lengths
+        int left_ref_bases, left_query_bases, right_ref_bases, right_query_bases
+        int pos
+        int index, i, consumed, query_pos
+    for op, length in cigartuples:
+        ops.push_back(op)
+        lengths.push_back(length)
+    query_sequence = None
+    result = []
+    for index, i, consumed, query_pos in _iterate_cigar(variants, j, bam_read, cigartuples):
+        variant = variants[index]
+        alts = variant.get_alt_allele_list()
+        # Do not process symbolic alleles like <DEL>, <DUP>, etc.
+        if any(alt.startswith("<") for alt in alts):
+            continue
+        reference_allele = variant.reference_allele
+        _cigar_prefix_length(ops, lengths, i, consumed, True, overhang, &left_ref_bases, &left_query_bases)
+        _cigar_prefix_length(ops, lengths, i, consumed, False, len(reference_allele) + overhang, &right_ref_bases, &right_query_bases)
+        pos = variant.position
+        assert pos - left_ref_bases >= 0
+        assert pos + right_ref_bases <= len(reference)
+        if query_sequence is None:
+            query_sequence = bam_read.query_sequence
+        query = query_sequence[query_pos - left_query_bases : query_pos + right_query_bases]
+        left_pad = reference[pos - left_ref_bases : pos]
+        right_pad = reference[pos + len(reference_allele) : pos + right_ref_bases]
+        padded_alleles = [reference[pos - left_ref_bases : pos + right_ref_bases]]
+        for alt in alts:
+            padded_alleles.append(left_pad + alt + right_pad)
+        restricted = restricted_genotypes[index] if restricted_genotypes else None
+        if restricted is not None:
+            restricted = restricted.as_vector()
+        distances = [
+            (k, edit_distance(query, allele))
+            for k, allele in enumerate(padded_alleles)
+            if restricted is None or k in restricted
+        ]
+        distances.sort(key=lambda x: x[1])
+        if len(distances) == 1 or distances[0][1] < distances[1][1]:
+            allele = distances[0][0]
+            if allele in range(len(alts) + 1):
+                result.append((index, allele, 30))
+    return result

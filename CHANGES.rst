@@ -13,6 +13,8 @@ development version
   The result is identical. On a human 30x HiFi sample, the DP takes 33 times
   less time (``phase`` in total 2.7 times less) and slightly less memory.
 * Faster read selection (28% less time; the selected reads are the same).
+* Faster allele detection by realignment (the default; not with
+  ``--use-kmerald`` or affine gap costs): 10% less time to read the alignments.
 
 v2.8 (2025-06-08)
 -----------------
