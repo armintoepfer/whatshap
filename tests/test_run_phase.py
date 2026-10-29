@@ -1064,6 +1064,13 @@ def test_paired_end_phase(tmp_path):
             "distrust_genotypes": True,
         },
         {
+            "phase_input_files": [
+                "tests/data/phased-blocks.reads.bam",
+                "tests/data/phased-blocks.blocks.vcf",
+            ],
+            "variant_file": "tests/data/phased-blocks.variants.vcf",
+        },
+        {
             "phase_input_files": [recombination_breaks_bamfile],
             "variant_file": "tests/data/quartet.vcf.gz",
             "ped": "tests/data/recombination_breaks.ped",

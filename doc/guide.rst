@@ -262,6 +262,17 @@ which can be specified by the respective flags ``--error-rate=0.15``,
 example) when running ``whatshap phase``.
 
 
+.. _phasing-in-parallel:
+
+Phasing chromosomes in parallel
+-------------------------------
+
+With ``--threads N``, ``whatshap phase`` phases up to N chromosomes at the
+same time in worker processes. The output is the same for any number of
+threads. The run takes at least as long as the largest chromosome, so more
+threads than chromosomes do not help. Each worker holds the reads and
+variants of one chromosome, so the memory usage grows with N.
+
 .. _phasing_in_vcfs:
 
 Representation of phasing information in VCFs

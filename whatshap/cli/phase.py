@@ -6,13 +6,13 @@ blocks) and phase the variants. The phased VCF is written to standard output.
 """
 
 import logging
-import multiprocessing
 import pickle
 import sys
 import platform
 
 from argparse import SUPPRESS
 from collections import defaultdict, deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -812,8 +812,8 @@ def _init_worker(settings: PhasingSettings, reader_arguments: dict, log_level: i
 
 
 def _phase_chromosome_in_worker(pickled_variant_table: bytes):
-    # The task is unpickled here and not by multiprocessing, so that an error
-    # reaches the main process (instead of a worker that ends and a pool that waits)
+    # The task is unpickled here, so that an error reaches the main process as the
+    # exception of this task
     variant_table = pickle.loads(pickled_variant_table)
     collector = _worker_state["collector"]
     collector.records = []
@@ -838,42 +838,43 @@ def phase_chromosomes_in_parallel(
     of the input VCF, with write_chromosome. The log messages of a chromosome are emitted
     before it is written, in the same order as without worker processes.
     """
+    # (chromosome, Future or None if the chromosome is not phased), in VCF order
+    pending: deque = deque()
 
     def write_next():
-        chromosome, async_result = pending.popleft()
-        if async_result is None:
+        chromosome, future = pending.popleft()
+        if future is None:
             write_chromosome(chromosome, None)
             return
-        phased, records, stages = async_result.get()
+        phased, records, stages = future.result()
         for record in records:
             logging.getLogger(record.name).handle(record)
         timers.add(stages)
         write_chromosome(chromosome, phased)
 
+    def write_done():
+        while pending and (pending[0][1] is None or pending[0][1].done()):
+            write_next()
+
     log_level = logging.getLogger().getEffectiveLevel()
-    with multiprocessing.Pool(
+    with ProcessPoolExecutor(
         threads, initializer=_init_worker, initargs=(settings, reader_arguments, log_level)
-    ) as pool:
-        # (chromosome, AsyncResult or None if the chromosome is not phased), in VCF order
-        pending: deque = deque()
+    ) as executor:
+        running: set = set()
         for variant_table in timers.iterate("parse_vcf", vcf_reader):
             chromosome = variant_table.chromosome
             if chromosome in included_chromosomes:
-                pending.append(
-                    (
-                        chromosome,
-                        pool.apply_async(
-                            _phase_chromosome_in_worker, (pickle.dumps(variant_table),)
-                        ),
-                    )
-                )
+                future = executor.submit(_phase_chromosome_in_worker, pickle.dumps(variant_table))
+                running.add(future)
+                pending.append((chromosome, future))
             else:
                 pending.append((chromosome, None))
-            # Write what is done; keep at most as many chromosomes in work as there are workers
-            while pending and (
-                pending[0][1] is None or pending[0][1].ready() or len(pending) > threads
-            ):
-                write_next()
+            write_done()
+            # Keep one chromosome more than there are workers in work, so that a worker
+            # that becomes free does not wait for the main process to parse the next one
+            while len(running) > threads:
+                _, running = wait(running, return_when=FIRST_COMPLETED)
+                write_done()
         while pending:
             write_next()
 
@@ -1264,7 +1265,8 @@ def add_arguments(parser):
         help="Write reads that have been used for phasing to FILE.")
     arg("--threads", type=int, default=1,
         help="Number of worker processes that phase chromosomes in parallel. "
-        "The output is the same for any number. Default: %(default)s")
+        "The output is the same for any number. Each worker holds the data of one "
+        "chromosome, so memory usage grows with the number. Default: %(default)s")
     arg("--algorithm", choices=("whatshap", "hapchat", "heuristic"), default="whatshap",
         help="Phasing algorithm to use (default: %(default)s)")
 
