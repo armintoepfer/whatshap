@@ -297,6 +297,4 @@ def test_single_individual_dp_identical():
     ]:
         for _ in range(repeats):
             readset = random_readset(rng, n_positions, n_reads, max_span, qualities, max_first)
-            assert phase_single_individual(readset, True) == phase_single_individual(
-                readset, False
-            )
+            assert phase_single_individual(readset, True) == phase_single_individual(readset, False)
