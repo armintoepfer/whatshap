@@ -504,7 +504,9 @@ def random_pedigree_case(rng, individuals, triples, n_positions, n_reads, max_sp
             [PhredGenotypeLikelihoods([rng.randrange(8) for _ in range(3)]) for _ in positions],
         )
     for father, mother, child in triples:
-        pedigree.add_relationship(f"individual{father}", f"individual{mother}", f"individual{child}")
+        pedigree.add_relationship(
+            f"individual{father}", f"individual{mother}", f"individual{child}"
+        )
     readset = ReadSet()
     for index in range(n_reads):
         first = rng.randrange(n_positions - 1)
@@ -551,12 +553,16 @@ def test_pedigree_dp_identical():
     single = (1, [])
     trio = (3, [(0, 1, 2)])
     quartet = (4, [(0, 1, 2), (0, 1, 3)])
+    three_generations = (5, [(0, 1, 2), (2, 3, 4)])
+    three_children = (5, [(0, 1, 2), (0, 1, 3), (0, 1, 4)])  # 64 transmission configurations
     for (individuals, triples), n_positions, n_reads, max_span, qualities, repeats in [
         (single, 20, 20, 6, [1, 2], 20),
         (trio, 3, 5, 3, [1], 30),
         (trio, 30, 40, 8, [1, 2], 30),
         (trio, 80, 90, 12, [1, 2, 3, 30], 20),
         (quartet, 20, 25, 6, [1, 2], 20),
+        (three_generations, 12, 15, 4, [1, 2], 10),
+        (three_children, 6, 8, 3, [1, 2], 10),
     ]:
         for _ in range(repeats):
             readset, recombcost, pedigree = random_pedigree_case(
