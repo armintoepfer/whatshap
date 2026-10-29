@@ -84,7 +84,7 @@ cdef extern from "pedigree.h":
 
 cdef extern from "pedigreedptable.h":
     cdef cppclass PedigreeDPTable:
-        PedigreeDPTable(ReadSet*, vector[unsigned int], Pedigree* pedigree, bool distrust_genotypes, vector[unsigned int]* positions, bool allow_single_individual_dp) except +
+        PedigreeDPTable(ReadSet*, vector[unsigned int], Pedigree* pedigree, bool distrust_genotypes, vector[unsigned int]* positions, bool allow_fast_dp) except +
         void get_super_reads(vector[ReadSet*]*, vector[unsigned int]* transmission_vector) except +
         int get_optimal_score() except +
         vector[bool]* get_optimal_partitioning()

@@ -2,10 +2,12 @@
 Test phasing of pedigrees (PedMEC algorithm)
 """
 
+import random
 from collections import defaultdict
 from pytest import raises
 from whatshap.core import (
     PedigreeDPTable,
+    Read,
     ReadSet,
     Pedigree,
     NumericSampleIds,
@@ -478,3 +480,89 @@ def test_phase_trio_genotype_likelihoods():
     all_expected_haplotypes = [("111", "010"), ("001", "110"), ("001", "010")]
     assert_haplotypes(superreads_list, all_expected_haplotypes, 3)
     assert_trio_allele_order(superreads_list, transmission_vector, 3)
+
+
+def random_pedigree_case(rng, individuals, triples, n_positions, n_reads, max_span, qualities):
+    """A random read set and pedigree. Genotypes follow Mendel's laws, with a few exceptions."""
+    positions = [10 * (i + 1) for i in range(n_positions)]
+    genotypes = {}
+    for individual in range(individuals):
+        genotypes[individual] = [rng.choice([0, 1, 1, 1, 2]) for _ in positions]
+    for father, mother, child in triples:
+        for i in range(n_positions):
+            alleles = [[0, 0], [0, 1], [1, 1]]
+            genotypes[child][i] = rng.choice(alleles[genotypes[father][i]]) + rng.choice(
+                alleles[genotypes[mother][i]]
+            )
+            if rng.random() < 0.02:
+                genotypes[child][i] = rng.randrange(3)
+    pedigree = Pedigree(NumericSampleIds())
+    for individual in range(individuals):
+        pedigree.add_individual(
+            f"individual{individual}",
+            canonic_index_list_to_biallelic_gt_list(genotypes[individual]),
+            [PhredGenotypeLikelihoods([rng.randrange(8) for _ in range(3)]) for _ in positions],
+        )
+    for father, mother, child in triples:
+        pedigree.add_relationship(f"individual{father}", f"individual{mother}", f"individual{child}")
+    readset = ReadSet()
+    for index in range(n_reads):
+        first = rng.randrange(n_positions - 1)
+        last = min(n_positions - 1, first + rng.randrange(1, max_span))
+        read = Read(f"read{index}", 50, 0, rng.randrange(individuals))
+        for i in range(first, last + 1):
+            if i in (first, last) or rng.random() < 0.8:
+                read.add_variant(positions[i], rng.randrange(2), rng.choice(qualities))
+        readset.add(read)
+    readset.sort()
+    recombcost = [rng.choice([0, 1, 3, 50]) for _ in positions]
+    return readset, recombcost, pedigree
+
+
+def phase_pedigree_result(readset, recombcost, pedigree, distrust_genotypes, allow_fast_dp):
+    try:
+        dp_table = PedigreeDPTable(
+            readset,
+            recombcost,
+            pedigree,
+            distrust_genotypes,
+            readset.get_positions(),
+            allow_fast_dp=allow_fast_dp,
+        )
+        superreads_list, transmission_vector = dp_table.get_super_reads()
+    except RuntimeError as e:
+        return str(e)
+    haplotypes = [
+        [[(v.position, v.allele, v.quality) for v in sr] for sr in superreads]
+        for superreads in superreads_list
+    ]
+    return (
+        haplotypes,
+        transmission_vector,
+        dp_table.get_optimal_cost(),
+        dp_table.get_optimal_partitioning(),
+    )
+
+
+def test_pedigree_dp_identical():
+    # The fast DP columns give the same result as the reference columns, also for ties
+    # (few distinct qualities), recombination costs of 0 and Mendelian conflicts
+    rng = random.Random(1)
+    single = (1, [])
+    trio = (3, [(0, 1, 2)])
+    quartet = (4, [(0, 1, 2), (0, 1, 3)])
+    for (individuals, triples), n_positions, n_reads, max_span, qualities, repeats in [
+        (single, 20, 20, 6, [1, 2], 20),
+        (trio, 3, 5, 3, [1], 30),
+        (trio, 30, 40, 8, [1, 2], 30),
+        (trio, 80, 90, 12, [1, 2, 3, 30], 20),
+        (quartet, 20, 25, 6, [1, 2], 20),
+    ]:
+        for _ in range(repeats):
+            readset, recombcost, pedigree = random_pedigree_case(
+                rng, individuals, triples, n_positions, n_reads, max_span, qualities
+            )
+            for distrust_genotypes in (False, True):
+                assert phase_pedigree_result(
+                    readset, recombcost, pedigree, distrust_genotypes, True
+                ) == phase_pedigree_result(readset, recombcost, pedigree, distrust_genotypes, False)

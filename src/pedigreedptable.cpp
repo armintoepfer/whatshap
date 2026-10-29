@@ -265,12 +265,12 @@ unsigned int solve_single_individual(const single_individual_columns_t& columns,
 
 } // namespace
 
-PedigreeDPTable::PedigreeDPTable(ReadSet* read_set, const vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const vector<unsigned int>* positions, bool allow_single_individual_dp) :
+PedigreeDPTable::PedigreeDPTable(ReadSet* read_set, const vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const vector<unsigned int>* positions, bool allow_fast_dp) :
 	read_set(read_set),
 	recombcost(recombcost),
 	pedigree(pedigree),
 	distrust_genotypes(distrust_genotypes),
-	allow_single_individual_dp(allow_single_individual_dp),
+	allow_fast_dp(allow_fast_dp),
 	optimal_score(0u),
 	optimal_score_index(0u),
 	input_column_iterator(*read_set, positions)
@@ -345,7 +345,7 @@ void PedigreeDPTable::compute_table() {
 		return;
 	}
 
-	if (allow_single_individual_dp && is_single_individual_het()) {
+	if (allow_fast_dp && is_single_individual_het()) {
 		compute_table_single_individual();
 		return;
 	}
@@ -532,9 +532,6 @@ void PedigreeDPTable::compute_column(size_t column_index, unique_ptr<vector<cons
 		current_input_column = input_column_iterator.get_next();
 	}
 
-	// reserve memory for the current DP column
-	Vector2D<unsigned int> dp_column(current_indexer->column_size(), transmission_configurations, 0);
-
 	// obtain previous projection column (which is assumed to have been already computed)
 	Vector2D<unsigned int>* previous_projection_column = nullptr;
 	if (column_index > 0) {
@@ -564,11 +561,33 @@ void PedigreeDPTable::compute_column(size_t column_index, unique_ptr<vector<cons
 		);
 	}
 
+	if (allow_fast_dp) {
+		compute_column_fast(column_index, *current_input_column, previous_projection_column, current_projection_column, index_backtrace_column, transmission_backtrace_column);
+	} else {
+		compute_column_reference(column_index, *current_input_column, previous_projection_column, current_projection_column, index_backtrace_column, transmission_backtrace_column);
+	}
+
+	// if not last column, then store computed tables
+	if (current_projection_column != 0) {
+		index_backtrace_table[column_index] = index_backtrace_column;
+		transmission_backtrace_table[column_index] = transmission_backtrace_column;
+		projection_column_table[column_index] = current_projection_column;
+	}
+}
+
+
+void PedigreeDPTable::compute_column_reference(size_t column_index, const vector<const Entry*>& current_input_column, const Vector2D<unsigned int>* previous_projection_column, Vector2D<unsigned int>* current_projection_column, Vector2D<unsigned int>* index_backtrace_column, Vector2D<unsigned int>* transmission_backtrace_column) {
+	ColumnIndexingScheme* current_indexer = indexers[column_index];
+	unsigned int transmission_configurations = pedigree_partitions.size();
+
+	// reserve memory for the current DP column
+	Vector2D<unsigned int> dp_column(current_indexer->column_size(), transmission_configurations, 0);
+
 	// create column cost computers
 	vector<PedigreeColumnCostComputer> cost_computers;
 	cost_computers.reserve(transmission_configurations);
 	for(unsigned int i = 0; i < transmission_configurations; ++i) {
-		cost_computers.emplace_back(*current_input_column, column_index, read_sources, pedigree, *pedigree_partitions[i], distrust_genotypes);
+		cost_computers.emplace_back(current_input_column, column_index, read_sources, pedigree, *pedigree_partitions[i], distrust_genotypes);
 	}
 
 	// iterate over all bipartitions
@@ -661,12 +680,180 @@ void PedigreeDPTable::compute_column(size_t column_index, unique_ptr<vector<cons
 			}
 		}
 	}
+}
 
-	// if not last column, then store computed tables
-	if (current_projection_column != 0) {
-		index_backtrace_table[column_index] = index_backtrace_column;
-		transmission_backtrace_table[column_index] = transmission_backtrace_column;
-		projection_column_table[column_index] = current_projection_column;
+
+void PedigreeDPTable::compute_column_fast(size_t column_index, const vector<const Entry*>& current_input_column, const Vector2D<unsigned int>* previous_projection_column, Vector2D<unsigned int>* current_projection_column, Vector2D<unsigned int>* index_backtrace_column, Vector2D<unsigned int>* transmission_backtrace_column) {
+	ColumnIndexingScheme* current_indexer = indexers[column_index];
+	const size_t transmission_configurations = pedigree_partitions.size();
+	const size_t n = current_input_column.size();
+	assert(n < 32);
+	const size_t individuals = pedigree->size();
+
+	// The allele assignments of PedigreeColumnCostComputer, as a mask over the haplotypes of all
+	// individuals (bit 2*individual+haplotype). Each mask occurs once, with its genotype cost;
+	// assignments[i] lists those that are allowed for transmission configuration i.
+	vector<unsigned int> masks;
+	vector<unsigned int> genotype_costs;
+	vector<vector<unsigned int> > assignments(transmission_configurations);
+	for (size_t i = 0; i < transmission_configurations; ++i) {
+		const PedigreePartitions& partitions = *pedigree_partitions[i];
+		for (unsigned int a = 0; a < (((unsigned int)1) << partitions.count()); ++a) {
+			bool genotypes_compatible = true;
+			unsigned int cost = 0;
+			unsigned int mask = 0;
+			for (size_t individuals_index = 0; individuals_index < individuals; ++individuals_index) {
+				unsigned int allele0 = (a >> partitions.haplotype_to_partition(individuals_index, 0)) & 1;
+				unsigned int allele1 = (a >> partitions.haplotype_to_partition(individuals_index, 1)) & 1;
+				mask |= (allele0 << (2 * individuals_index)) | (allele1 << (2 * individuals_index + 1));
+				Genotype genotype(vector<unsigned int>{allele0, allele1});
+				if (distrust_genotypes) {
+					const PhredGenotypeLikelihoods* gls = pedigree->get_genotype_likelihoods(individuals_index, column_index);
+					assert(gls != nullptr);
+					cost += gls->get(genotype);
+				} else {
+					const Genotype* true_genotype = pedigree->get_genotype(individuals_index, column_index);
+					if (genotype != (*true_genotype)) {
+						genotypes_compatible = false;
+						break;
+					}
+				}
+			}
+			if (!genotypes_compatible) {
+				continue;
+			}
+			const size_t m = std::find(masks.begin(), masks.end(), mask) - masks.begin();
+			if (m == masks.size()) {
+				masks.push_back(mask);
+				genotype_costs.push_back(cost);
+			}
+			assignments[i].push_back(m);
+		}
+	}
+
+	// per entry: its individual, and its cost on a haplotype with allele 0 (an ALT entry) or 1 (a REF entry)
+	vector<unsigned int> entry_individual(n);
+	vector<array<unsigned int, 2> > entry_cost(n, {0, 0});
+	for (size_t j = 0; j < n; ++j) {
+		const Entry& entry = *current_input_column[j];
+		entry_individual[j] = read_sources[entry.get_read_id()];
+		switch (entry.get_allele_type()) {
+		case Entry::REF_ALLELE:
+			entry_cost[j][1] = entry.get_phred_score();
+			break;
+		case Entry::ALT_ALLELE:
+			entry_cost[j][0] = entry.get_phred_score();
+			break;
+		case Entry::BLANK:
+			break;
+		default:
+			assert(false);
+		}
+	}
+
+	// value[m]: the cost of mask m for the current bipartition (bit j: the haplotype of entry j).
+	// Bipartition 0 puts all entries on haplotype 0. The sums are modulo 2^32 as in
+	// PedigreeColumnCostComputer, so the order of the additions does not change them.
+	vector<unsigned int> value(genotype_costs);
+	for (size_t m = 0; m < masks.size(); ++m) {
+		for (size_t j = 0; j < n; ++j) {
+			value[m] += entry_cost[j][(masks[m] >> (2 * entry_individual[j])) & 1];
+		}
+	}
+
+	// recombination cost between transmission configurations j (previous column) and i
+	vector<unsigned int> recombination(transmission_configurations * transmission_configurations);
+	for (size_t i = 0; i < transmission_configurations; ++i) {
+		for (size_t j = 0; j < transmission_configurations; ++j) {
+			recombination[i * transmission_configurations + j] = popcount(i ^ j) * recombcost[column_index];
+		}
+	}
+
+	const vector<unsigned int>* forward_projection_mask = current_indexer->get_forward_projection_mask();
+	const unsigned int backward_mask = (((unsigned int)1) << current_indexer->get_backward_projection_width()) - 1;
+	const unsigned int infinity = numeric_limits<unsigned int>::max();
+	vector<unsigned int> current_cost(transmission_configurations);
+	vector<unsigned int> min_value(transmission_configurations);
+	vector<unsigned int> min_recomb_index(transmission_configurations);
+	const vector<unsigned int> no_previous_cost(transmission_configurations, 0);
+	unsigned int forward_index = 0;
+	// the bipartitions in the order of ColumnIndexingIterator (Gray code)
+	const unsigned int states = ((unsigned int)1) << n;
+	for (unsigned int k = 0; k < states; ++k) {
+		const unsigned int index = k ^ (k >> 1);
+		if (k > 0) {
+			const int b = lowest_bit(k);
+			// entry b moves from haplotype "from" to haplotype "to" of its individual
+			const unsigned int to = (index >> b) & 1;
+			const unsigned int shift = 2 * entry_individual[b];
+			const array<unsigned int, 2>& cost = entry_cost[b];
+			for (size_t m = 0; m < masks.size(); ++m) {
+				value[m] += cost[(masks[m] >> (shift + to)) & 1];
+				value[m] -= cost[(masks[m] >> (shift + 1 - to)) & 1];
+			}
+			if ((forward_projection_mask != nullptr) && (forward_projection_mask->at(b) != (unsigned int)-1)) {
+				forward_index ^= ((unsigned int)1) << forward_projection_mask->at(b);
+			}
+		}
+
+		bool found_valid_transmission_vector = false;
+		for (size_t i = 0; i < transmission_configurations; ++i) {
+			unsigned int best = infinity;
+			for (unsigned int m : assignments[i]) {
+				if (value[m] < best) {
+					best = value[m];
+				}
+			}
+			current_cost[i] = best;
+			if (best < infinity) {
+				found_valid_transmission_vector = true;
+			}
+		}
+		if (!found_valid_transmission_vector) {
+			throw std::runtime_error("Error: Mendelian conflict");
+		}
+
+		// the same minimum over the previous transmission configurations as compute_column_reference
+		const unsigned int* previous_cost = (column_index > 0) ? &previous_projection_column->at(index & backward_mask, 0) : no_previous_cost.data();
+		for (size_t i = 0; i < transmission_configurations; ++i) {
+			unsigned int min = infinity;
+			size_t min_index = 0;
+			for (size_t j = 0; j < transmission_configurations; ++j) {
+				unsigned int val = infinity;
+				if ((current_cost[i] < infinity) && (previous_cost[j] < infinity)) {
+					val = current_cost[i] + previous_cost[j];
+				}
+				if (val < infinity) {
+					val += recombination[i * transmission_configurations + j];
+				}
+				if (val < min) {
+					min = val;
+					min_index = j;
+				}
+			}
+			min_value[i] = min;
+			min_recomb_index[i] = min_index;
+		}
+
+		if (current_projection_column == nullptr) {
+			for (size_t i = 0; i < transmission_configurations; ++i) {
+				if (min_value[i] < optimal_score) {
+					optimal_score = min_value[i];
+					optimal_score_index = index;
+					optimal_transmission_value = i;
+					previous_transmission_value = min_recomb_index[i];
+				}
+			}
+		} else {
+			unsigned int* projection = &current_projection_column->at(forward_index, 0);
+			for (size_t i = 0; i < transmission_configurations; ++i) {
+				if (min_value[i] < projection[i]) {
+					projection[i] = min_value[i];
+					index_backtrace_column->set(forward_index, i, index);
+					transmission_backtrace_column->set(forward_index, i, min_recomb_index[i]);
+				}
+			}
+		}
 	}
 }
 

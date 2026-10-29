@@ -28,7 +28,7 @@ private:
 	const std::vector<unsigned int>& recombcost;
 	const Pedigree* pedigree;
 	bool distrust_genotypes;
-	bool allow_single_individual_dp;
+	bool allow_fast_dp;
 	std::vector<PedigreePartitions*> pedigree_partitions;
 	// vector of indexingschemes
 	std::vector<ColumnIndexingScheme*> indexers;
@@ -65,11 +65,17 @@ private:
 	/** Computes indexers, index_path and the optimal score as compute_table does, for the case of
 	 *  is_single_individual_het(): one transmission configuration and two allele assignments.
 	 *  It visits the bipartitions of a column in the same order and resolves ties the same way,
-	 *  so the result is identical. It keeps the whole backtrace (no recomputation of columns). */
+	 *  so the result is identical. */
 	void compute_table_single_individual();
 	/** Computes the DP column at the given index, assuming that the previous column
 	 *  has already been computed. */
 	void compute_column(size_t column_index, std::unique_ptr<std::vector<const Entry*>> current_input_column = nullptr);
+	/** The bipartitions of compute_column, with one PedigreeColumnCostComputer per transmission configuration. */
+	void compute_column_reference(size_t column_index, const std::vector<const Entry*>& current_input_column, const Vector2D<unsigned int>* previous_projection_column, Vector2D<unsigned int>* current_projection_column, Vector2D<unsigned int>* index_backtrace_column, Vector2D<unsigned int>* transmission_backtrace_column);
+	/** The same values as compute_column_reference, in the same order (so with the same ties), with less
+	 *  work for each bipartition: one cost per allele assignment of the haplotypes, updated for each
+	 *  step of the Gray code, instead of one cost computer per transmission configuration. */
+	void compute_column_fast(size_t column_index, const std::vector<const Entry*>& current_input_column, const Vector2D<unsigned int>* previous_projection_column, Vector2D<unsigned int>* current_projection_column, Vector2D<unsigned int>* index_backtrace_column, Vector2D<unsigned int>* transmission_backtrace_column);
 
 	/** Returns the number of set bits. */
 	static size_t popcount(size_t x);
@@ -92,10 +98,11 @@ public:
 	 *                            (in the given pedigree object).
 	 *  @param positions Positions to work on. If 0, then all positions given in read_set will be used. Caller retains
 	 *                   ownership.
-	 *  @param allow_single_individual_dp If true, then the faster DP for one individual with heterozygous genotypes
-	 *                   is used when it applies. Its result is identical; false is for tests.
+	 *  @param allow_fast_dp If true, then the faster DP for one individual with heterozygous genotypes
+	 *                   is used when it applies, and a faster computation of the columns otherwise.
+	 *                   The result is identical; false is for tests.
 	 */
-	PedigreeDPTable(ReadSet* read_set, const std::vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const std::vector<unsigned int>* positions = nullptr, bool allow_single_individual_dp = true);
+	PedigreeDPTable(ReadSet* read_set, const std::vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const std::vector<unsigned int>* positions = nullptr, bool allow_fast_dp = true);
  
 	~PedigreeDPTable();
 

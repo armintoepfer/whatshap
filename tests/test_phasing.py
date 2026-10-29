@@ -259,7 +259,7 @@ def random_readset(rng, n_positions, n_reads, max_span, qualities, max_first=Non
     return readset
 
 
-def phase_single_individual(readset, allow_single_individual_dp):
+def phase_single_individual(readset, allow_fast_dp):
     positions = readset.get_positions()
     pedigree = Pedigree(NumericSampleIds())
     pedigree.add_individual(
@@ -272,7 +272,7 @@ def phase_single_individual(readset, allow_single_individual_dp):
         [1] * len(positions),
         pedigree,
         positions=positions,
-        allow_single_individual_dp=allow_single_individual_dp,
+        allow_fast_dp=allow_fast_dp,
     )
     superreads, transmission_vector = dp_table.get_super_reads()
     haplotypes = [[(v.position, v.allele, v.quality) for v in sr] for sr in superreads[0]]
