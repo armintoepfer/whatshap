@@ -11,13 +11,14 @@ development version
 * ``phase``: Faster solution of the MEC problem for a single individual
   (no pedigree) whose genotypes are trusted (no ``--distrust-genotypes``).
   The result is identical. On a human 30x HiFi sample, the DP takes 33 times
-  less time (``phase`` in total 2.7 times less) and slightly less memory.
+  less time. With the changes below, ``phase`` on the whole genome takes 4.7
+  times less time (6983 s to 1496 s) and 22% less memory.
 * Faster read selection (28% less time; the selected reads are the same).
 * Faster allele detection by realignment (the default; not with
   ``--use-kmerald`` or affine gap costs): 10% less time to read the alignments.
 * ``phase``: New option ``--threads``: worker processes phase the chromosomes in
   parallel. The output is the same for any number of threads. A human 30x HiFi
-  sample takes 185 s with ``--threads 21``.
+  sample takes 183 s with ``--threads 21`` (38 times less than 2.8).
 
 v2.8 (2025-06-08)
 -----------------
