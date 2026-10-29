@@ -8,6 +8,10 @@ development version
 * :issue:`624`: `haplotag` now ignores invalid BX tags (linked-read
   barcodes).
 * Dropped support for Python 3.9
+* ``phase``: Faster solution of the MEC problem for a single individual
+  (no pedigree) whose genotypes are trusted (no ``--distrust-genotypes``).
+  The result is identical. On a human 30x HiFi sample, the DP takes 33 times
+  less time (``phase`` in total 2.7 times less) and slightly less memory.
 
 v2.8 (2025-06-08)
 -----------------

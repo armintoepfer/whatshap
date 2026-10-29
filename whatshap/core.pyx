@@ -362,17 +362,20 @@ cdef class ReadSet:
 
 
 cdef class PedigreeDPTable:
-	def __cinit__(self, ReadSet readset, recombcost, Pedigree pedigree, bool distrust_genotypes = False, positions = None):
+	def __cinit__(self, ReadSet readset, recombcost, Pedigree pedigree, bool distrust_genotypes = False, positions = None, bool allow_single_individual_dp = True):
 		"""Build the DP table from the given read set which is assumed to be sorted;
 		that is, the variants in each read must be sorted by position and the reads
 		in the read set must also be sorted (by position of their left-most variant).
+
+		allow_single_individual_dp -- use the faster DP for one individual with
+		heterozygous genotypes when it applies (the result is identical; False is for tests)
 		"""
 		cdef vector[unsigned int]* c_positions = NULL
 		if positions is not None:
 			c_positions = new vector[unsigned int]()
 			for pos in positions:
 				c_positions.push_back(pos)
-		self.thisptr = new cpp.PedigreeDPTable(readset.thisptr, recombcost, pedigree.thisptr, distrust_genotypes, c_positions)
+		self.thisptr = new cpp.PedigreeDPTable(readset.thisptr, recombcost, pedigree.thisptr, distrust_genotypes, c_positions, allow_single_individual_dp)
 		self.pedigree = pedigree
 
 	def __dealloc__(self):

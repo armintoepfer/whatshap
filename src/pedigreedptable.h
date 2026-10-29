@@ -28,6 +28,7 @@ private:
 	const std::vector<unsigned int>& recombcost;
 	const Pedigree* pedigree;
 	bool distrust_genotypes;
+	bool allow_single_individual_dp;
 	std::vector<PedigreePartitions*> pedigree_partitions;
 	// vector of indexingschemes
 	std::vector<ColumnIndexingScheme*> indexers;
@@ -58,6 +59,14 @@ private:
 	 *  transmission_backtrace_table, optimal_score, optimal_score_index, optimal_transmission_value, and previous_transmission_value. */
 	void clear_table();
 	void compute_table();
+	/** Returns true when the DP has one individual with a fixed heterozygous genotype (0/1) in
+	 *  each column and no genotype distrust: then compute_table_single_individual applies. */
+	bool is_single_individual_het();
+	/** Computes indexers, index_path and the optimal score as compute_table does, for the case of
+	 *  is_single_individual_het(): one transmission configuration and two allele assignments.
+	 *  It visits the bipartitions of a column in the same order and resolves ties the same way,
+	 *  so the result is identical. It keeps the whole backtrace (no recomputation of columns). */
+	void compute_table_single_individual();
 	/** Computes the DP column at the given index, assuming that the previous column
 	 *  has already been computed. */
 	void compute_column(size_t column_index, std::unique_ptr<std::vector<const Entry*>> current_input_column = nullptr);
@@ -83,8 +92,10 @@ public:
 	 *                            (in the given pedigree object).
 	 *  @param positions Positions to work on. If 0, then all positions given in read_set will be used. Caller retains
 	 *                   ownership.
+	 *  @param allow_single_individual_dp If true, then the faster DP for one individual with heterozygous genotypes
+	 *                   is used when it applies. Its result is identical; false is for tests.
 	 */
-	PedigreeDPTable(ReadSet* read_set, const std::vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const std::vector<unsigned int>* positions = nullptr);
+	PedigreeDPTable(ReadSet* read_set, const std::vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const std::vector<unsigned int>* positions = nullptr, bool allow_single_individual_dp = true);
  
 	~PedigreeDPTable();
 

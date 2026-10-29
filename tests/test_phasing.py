@@ -1,5 +1,8 @@
+import random
+
 from pytest import fixture
 from whatshap.core import (
+    Read,
     ReadSet,
     PedigreeDPTable,
     Pedigree,
@@ -236,3 +239,64 @@ def test_weighted_phasing1():
        2    111
     """
     check_phasing_single_individual(reads, "whatshap", weights)
+
+
+def random_readset(rng, n_positions, n_reads, max_span, qualities, max_first=None):
+    positions = [10 * (i + 1) for i in range(n_positions)]
+    reads = []
+    for index in range(n_reads):
+        first = rng.randrange(max_first or (n_positions - 1))
+        last = min(n_positions - 1, first + rng.randrange(1, max_span))
+        read = Read(f"read{index}", 50, 0)
+        covered = [i for i in range(first, last + 1) if i in (first, last) or rng.random() < 0.8]
+        for i in covered:
+            read.add_variant(positions[i], rng.randrange(2), rng.choice(qualities))
+        reads.append(read)
+    readset = ReadSet()
+    for read in reads:
+        readset.add(read)
+    readset.sort()
+    return readset
+
+
+def phase_single_individual(readset, allow_single_individual_dp):
+    positions = readset.get_positions()
+    pedigree = Pedigree(NumericSampleIds())
+    pedigree.add_individual(
+        "individual0",
+        [canonic_index_to_biallelic_gt(1) for _ in positions],
+        [None] * len(positions),
+    )
+    dp_table = PedigreeDPTable(
+        readset,
+        [1] * len(positions),
+        pedigree,
+        positions=positions,
+        allow_single_individual_dp=allow_single_individual_dp,
+    )
+    superreads, transmission_vector = dp_table.get_super_reads()
+    haplotypes = [[(v.position, v.allele, v.quality) for v in sr] for sr in superreads[0]]
+    return (
+        haplotypes,
+        transmission_vector,
+        dp_table.get_optimal_cost(),
+        dp_table.get_optimal_partitioning(),
+    )
+
+
+def test_single_individual_dp_identical():
+    # The DP for one heterozygous individual gives the same result as the general DP,
+    # also for ties (few distinct qualities) and for columns of more than 16 reads
+    rng = random.Random(1)
+    for n_positions, n_reads, max_span, qualities, max_first, repeats in [
+        (2, 3, 2, [1], None, 20),
+        (30, 40, 8, [1, 2], None, 20),
+        (60, 60, 12, [1, 2, 3, 30], None, 20),
+        (200, 120, 20, [5, 10, 20, 30, 40, 60], None, 20),
+        (12, 18, 12, [1, 2, 3], 2, 3),  # columns of more than 16 active reads
+    ]:
+        for _ in range(repeats):
+            readset = random_readset(rng, n_positions, n_reads, max_span, qualities, max_first)
+            assert phase_single_individual(readset, True) == phase_single_individual(
+                readset, False
+            )

@@ -6,17 +6,271 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <cstdint>
 
+#include "genotype.h"
 #include "pedigreecolumncostcomputer.h"
 #include "pedigreedptable.h"
 
 using namespace std;
 
-PedigreeDPTable::PedigreeDPTable(ReadSet* read_set, const vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const vector<unsigned int>* positions) :
+namespace {
+
+/** The columns of a DP for one individual (see PedigreeDPTable::compute_table_single_individual).
+ *  Entry j of a column is its j-th active read (read id order), bit j of a bipartition index. */
+struct single_individual_columns_t {
+	// per column: the number of active reads, the reads shared with the previous column,
+	// and the offset of its entries
+	vector<unsigned int> size;
+	vector<unsigned int> backward_width;
+	vector<size_t> offset;
+	// per entry: the phred score of a REF allele (0 otherwise), of an ALT allele (0 otherwise),
+	// and its bit in the forward projection (-1: the read ends in this column)
+	vector<unsigned int> ref_score;
+	vector<unsigned int> alt_score;
+	vector<int> forward_bit;
+	unsigned int max_size = 0;
+};
+
+/** The step of the Gray code of GrayCodes that visits a bipartition index (the inverse Gray code). */
+inline unsigned int gray_rank(unsigned int index) {
+	index ^= index >> 1;
+	index ^= index >> 2;
+	index ^= index >> 4;
+	index ^= index >> 8;
+	index ^= index >> 16;
+	return index;
+}
+
+/** The index of the lowest set bit of x > 0: the bit that GrayCodes changes in step x. */
+inline int lowest_bit(unsigned int x) {
+#if defined(__GNUC__)
+	return __builtin_ctz(x);
+#else
+	int i = 0;
+	while ((x & 1u) == 0) {
+		x >>= 1;
+		++i;
+	}
+	return i;
+#endif
+}
+
+/** One column of the DP in the order of ColumnIndexingIterator (Gray code), for columns of any size.
+ *  previous: the projection of the previous column; projection, backtrace: the forward projection
+ *  of this column and the index that gives each entry (not written for the last column).
+ *  For the last column, returns the first index with the minimum value in optimal_index. */
+template <class Index>
+void single_individual_column_gray(const single_individual_columns_t& columns, size_t c, bool last, const vector<unsigned int>& previous, vector<unsigned int>& projection, Index* backtrace, unsigned int& optimal_score, unsigned int& optimal_index) {
+	const unsigned int n = columns.size[c];
+	const size_t o = columns.offset[c];
+	const unsigned int backward_mask = (((unsigned int)1) << columns.backward_width[c]) - 1;
+	// the costs of the entries in partition 0 and 1, by allele
+	unsigned int ref0 = 0, alt0 = 0, ref1 = 0, alt1 = 0;
+	for (unsigned int j = 0; j < n; ++j) {
+		ref0 += columns.ref_score[o + j];
+		alt0 += columns.alt_score[o + j];
+	}
+	unsigned int forward = 0;
+	const unsigned int states = ((unsigned int)1) << n;
+	for (unsigned int k = 0; k < states; ++k) {
+		const unsigned int index = k ^ (k >> 1);
+		if (k > 0) {
+			const int b = lowest_bit(k);
+			if (((index >> b) & 1) != 0) {
+				ref0 -= columns.ref_score[o + b];
+				alt0 -= columns.alt_score[o + b];
+				ref1 += columns.ref_score[o + b];
+				alt1 += columns.alt_score[o + b];
+			} else {
+				ref1 -= columns.ref_score[o + b];
+				alt1 -= columns.alt_score[o + b];
+				ref0 += columns.ref_score[o + b];
+				alt0 += columns.alt_score[o + b];
+			}
+			if (columns.forward_bit[o + b] >= 0) {
+				forward ^= ((unsigned int)1) << columns.forward_bit[o + b];
+			}
+		}
+		// the two allele assignments: partition 0 ALT and partition 1 REF, or the opposite
+		unsigned int value = std::min(ref0 + alt1, alt0 + ref1);
+		if (c > 0) {
+			const unsigned int previous_value = previous[index & backward_mask];
+			value = (previous_value == numeric_limits<unsigned int>::max()) ? previous_value : value + previous_value;
+		}
+		if (last) {
+			if (value < optimal_score) {
+				optimal_score = value;
+				optimal_index = index;
+			}
+		} else if (value < projection[forward]) {
+			projection[forward] = value;
+			backtrace[forward] = (Index)index;
+		}
+	}
+}
+
+/** The same column as array operations, for columns of at most 16 reads. The reads shared with the
+ *  previous column are the low bits of an index, so the value of each index is its cost plus the
+ *  previous projection at its low bits. The forward projection then takes, for each read that ends,
+ *  the better index of each pair that differs in its bit. The Gray code order keeps the first
+ *  minimum (strict <), so a tie goes to the index of the smaller Gray rank, here too. */
+template <class Index>
+void single_individual_column_array(const single_individual_columns_t& columns, size_t c, bool last, const vector<unsigned int>& previous, vector<unsigned int>& projection, Index* backtrace, unsigned int& optimal_score, unsigned int& optimal_index, vector<int>& diff, vector<unsigned int>& value, vector<unsigned int>& origin) {
+	const unsigned int n = columns.size[c];
+	const size_t o = columns.offset[c];
+	const size_t states = ((size_t)1) << n;
+	const size_t shared = ((size_t)1) << columns.backward_width[c];
+	// cost = min(ref0 + alt1, alt0 + ref1) = min(ref_total - d, alt_total + d), d = ref1 - alt1
+	long long ref_total = 0, alt_total = 0;
+	diff.assign(states, 0);
+	for (unsigned int j = 0; j < n; ++j) {
+		ref_total += columns.ref_score[o + j];
+		alt_total += columns.alt_score[o + j];
+		const int d = (int)columns.ref_score[o + j] - (int)columns.alt_score[o + j];
+		const size_t half = ((size_t)1) << j;
+		for (size_t i = 0; i < half; ++i) {
+			diff[half + i] = diff[i] + d;
+		}
+	}
+	value.resize(states);
+	origin.resize(states);
+	for (size_t high = 0; high < states; high += shared) {
+		for (size_t low = 0; low < shared; ++low) {
+			const long long d = diff[high + low];
+			const unsigned int cost = (unsigned int)std::min(ref_total - d, alt_total + d);
+			unsigned int v = cost;
+			if (c > 0) {
+				v = (previous[low] == numeric_limits<unsigned int>::max()) ? previous[low] : cost + previous[low];
+			}
+			value[high + low] = v;
+			origin[high + low] = (unsigned int)(high + low);
+		}
+	}
+	if (last) {
+		size_t best = 0;
+		for (size_t i = 1; i < states; ++i) {
+			if ((value[i] < value[best]) || ((value[i] == value[best]) && (gray_rank(origin[i]) < gray_rank(origin[best])))) {
+				best = i;
+			}
+		}
+		if (value[best] < optimal_score) {
+			optimal_score = value[best];
+			optimal_index = origin[best];
+		}
+		return;
+	}
+	// remove the bit of each read that ends here, the highest first (the lower bits keep their places)
+	size_t size = states;
+	for (unsigned int j = n; j-- > 0;) {
+		if (columns.forward_bit[o + j] >= 0) {
+			continue;
+		}
+		const size_t bit = ((size_t)1) << j;
+		size_t w = 0;
+		for (size_t block = 0; block < size; block += 2 * bit) {
+			for (size_t i = block; i < block + bit; ++i) {
+				const bool second = (value[i + bit] < value[i]) || ((value[i + bit] == value[i]) && (gray_rank(origin[i + bit]) < gray_rank(origin[i])));
+				value[w] = second ? value[i + bit] : value[i];
+				origin[w] = second ? origin[i + bit] : origin[i];
+				++w;
+			}
+		}
+		size = w;
+	}
+	assert(size == projection.size());
+	for (size_t i = 0; i < size; ++i) {
+		projection[i] = value[i];
+		backtrace[i] = (Index)origin[i];
+	}
+}
+
+/** Computes the columns [from, to) of the DP for one individual. previous holds the projection of
+ *  column from-1 (empty for column 0) and then the projection of column to-1. backtrace and offset
+ *  get the backtrace of each column c < to (except the last column of the table), at offset[c - from].
+ *  The last column of the table sets optimal_score and optimal_index. */
+template <class Index>
+void single_individual_forward(const single_individual_columns_t& columns, size_t from, size_t to, vector<unsigned int>& previous, vector<Index>& backtrace, vector<size_t>& offset, unsigned int& optimal_score, unsigned int& optimal_index, vector<unsigned int>& projection, vector<int>& diff, vector<unsigned int>& value, vector<unsigned int>& origin) {
+	const size_t column_count = columns.size.size();
+	offset.assign(to - from, 0);
+	size_t total = 0;
+	for (size_t c = from; (c < to) && (c + 1 < column_count); ++c) {
+		offset[c - from] = total;
+		total += ((size_t)1) << columns.backward_width[c + 1];
+	}
+	backtrace.resize(total);
+	for (size_t c = from; c < to; ++c) {
+		const bool last = (c + 1 == column_count);
+		Index* column_backtrace = nullptr;
+		if (!last) {
+			projection.assign(((size_t)1) << columns.backward_width[c + 1], numeric_limits<unsigned int>::max());
+			column_backtrace = backtrace.data() + offset[c - from];
+		}
+		if (columns.size[c] <= 16) {
+			single_individual_column_array<Index>(columns, c, last, previous, projection, column_backtrace, optimal_score, optimal_index, diff, value, origin);
+		} else {
+			single_individual_column_gray<Index>(columns, c, last, previous, projection, column_backtrace, optimal_score, optimal_index);
+		}
+		if (!last) {
+			previous.swap(projection);
+		}
+	}
+}
+
+/** The forward pass and the backtrace of the DP for one individual. Fills index_path with the
+ *  bipartition index of each column and returns the optimal score. As compute_table, it keeps the
+ *  projection of every k-th column (k = sqrt(#columns)) and computes the backtrace of a block of
+ *  k columns again when the backtrace needs it. */
+template <class Index>
+unsigned int solve_single_individual(const single_individual_columns_t& columns, vector<index_and_inheritance_t>& index_path) {
+	const size_t column_count = columns.size.size();
+	const size_t k = std::max((size_t)1, (size_t)sqrt(column_count));
+	const size_t block_count = (column_count + k - 1) / k;
+	// checkpoints[b]: the projection that enters column b*k
+	vector<vector<unsigned int> > checkpoints(block_count);
+	vector<unsigned int> previous;
+	vector<Index> backtrace;
+	vector<size_t> offset;
+	vector<unsigned int> projection, value, origin;
+	vector<int> diff;
+	unsigned int optimal_score = numeric_limits<unsigned int>::max();
+	unsigned int optimal_index = 0;
+	for (size_t b = 0; b < block_count; ++b) {
+		checkpoints[b] = previous;
+		single_individual_forward<Index>(columns, b * k, std::min((b + 1) * k, column_count), previous, backtrace, offset, optimal_score, optimal_index, projection, diff, value, origin);
+	}
+
+	// backtrace and offset hold the last block now
+	index_path.assign(column_count, index_and_inheritance_t());
+	unsigned int index = optimal_index;
+	size_t block = block_count - 1;
+	for (size_t c = column_count; c-- > 0;) {
+		index_path[c].index = index;
+		if (c == 0) {
+			break;
+		}
+		if (c - 1 < block * k) {
+			// column c-1 is in the previous block: compute its backtrace again
+			--block;
+			previous = checkpoints[block];
+			unsigned int unused_score = numeric_limits<unsigned int>::max();
+			unsigned int unused_index = 0;
+			single_individual_forward<Index>(columns, block * k, (block + 1) * k, previous, backtrace, offset, unused_score, unused_index, projection, diff, value, origin);
+		}
+		const unsigned int backward_mask = (((unsigned int)1) << columns.backward_width[c]) - 1;
+		index = backtrace[offset[c - 1 - block * k] + (index & backward_mask)];
+	}
+	return optimal_score;
+}
+
+} // namespace
+
+PedigreeDPTable::PedigreeDPTable(ReadSet* read_set, const vector<unsigned int>& recombcost, const Pedigree* pedigree, bool distrust_genotypes, const vector<unsigned int>* positions, bool allow_single_individual_dp) :
 	read_set(read_set),
 	recombcost(recombcost),
 	pedigree(pedigree),
 	distrust_genotypes(distrust_genotypes),
+	allow_single_individual_dp(allow_single_individual_dp),
 	optimal_score(0u),
 	optimal_score_index(0u),
 	input_column_iterator(*read_set, positions)
@@ -88,6 +342,11 @@ void PedigreeDPTable::compute_table() {
 	if (input_column_iterator.get_column_count() == 0) {
 		optimal_score = 0;
 		optimal_score_index = 0;
+		return;
+	}
+
+	if (allow_single_individual_dp && is_single_individual_het()) {
+		compute_table_single_individual();
 		return;
 	}
 
@@ -171,6 +430,83 @@ void PedigreeDPTable::compute_table() {
 			}
 		}
 	}
+}
+
+
+bool PedigreeDPTable::is_single_individual_het() {
+	if (distrust_genotypes || (pedigree->size() != 1) || (pedigree->triple_count() != 0)) {
+		return false;
+	}
+	const Genotype het(vector<uint32_t>{0, 1});
+	for (size_t i = 0; i < input_column_iterator.get_positions()->size(); ++i) {
+		const Genotype* genotype = pedigree->get_genotype(0, i);
+		if ((genotype == nullptr) || (*genotype != het)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+
+void PedigreeDPTable::compute_table_single_individual() {
+	const size_t column_count = input_column_iterator.get_column_count();
+	single_individual_columns_t columns;
+	columns.size.reserve(column_count);
+	columns.backward_width.reserve(column_count);
+	columns.offset.reserve(column_count);
+
+	// the same indexers as compute_table (get_optimal_partitioning reads them)
+	input_column_iterator.jump_to_column(0);
+	for (size_t column_index = 0; column_index < column_count; ++column_index) {
+		unique_ptr<vector<const Entry *> > column = input_column_iterator.get_next();
+		unique_ptr<vector<unsigned int> > read_ids = extract_read_ids(*column);
+		ColumnIndexingScheme* previous_indexer = (column_index > 0) ? indexers[column_index - 1] : nullptr;
+		indexers[column_index] = new ColumnIndexingScheme(previous_indexer, *read_ids);
+		if (previous_indexer != nullptr) {
+			previous_indexer->set_next_column(indexers[column_index]);
+		}
+		columns.size.push_back(column->size());
+		columns.backward_width.push_back(indexers[column_index]->get_backward_projection_width());
+		columns.offset.push_back(columns.ref_score.size());
+		columns.max_size = std::max(columns.max_size, (unsigned int)column->size());
+		for (const Entry* entry : *column) {
+			switch (entry->get_allele_type()) {
+			case Entry::REF_ALLELE:
+				columns.ref_score.push_back(entry->get_phred_score());
+				columns.alt_score.push_back(0);
+				break;
+			case Entry::ALT_ALLELE:
+				columns.ref_score.push_back(0);
+				columns.alt_score.push_back(entry->get_phred_score());
+				break;
+			case Entry::BLANK:
+				columns.ref_score.push_back(0);
+				columns.alt_score.push_back(0);
+				break;
+			default:
+				assert(false);
+			}
+			columns.forward_bit.push_back(-1);
+		}
+	}
+	// the bit of each entry in the forward projection of its column
+	for (size_t column_index = 0; column_index + 1 < column_count; ++column_index) {
+		const vector<unsigned int>* mask = indexers[column_index]->get_forward_projection_mask();
+		for (size_t j = 0; j < mask->size(); ++j) {
+			columns.forward_bit[columns.offset[column_index] + j] = (int)mask->at(j);
+		}
+	}
+
+	// The backtrace takes 16 bits per entry when no column has more than 16 active reads
+	// (the read selection keeps a coverage of 15 by default).
+	if (columns.max_size <= 16) {
+		optimal_score = solve_single_individual<uint16_t>(columns, index_path);
+	} else {
+		optimal_score = solve_single_individual<uint32_t>(columns, index_path);
+	}
+	optimal_score_index = index_path.back().index;
+	optimal_transmission_value = 0;
+	previous_transmission_value = 0;
 }
 
 
