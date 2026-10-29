@@ -556,15 +556,9 @@ cdef class Genotype:
 	def __lt__(self, Genotype g):
 		return self.thisptr[0] < g.thisptr[0]
 
-	def __getstate__(self):
-		return (self.thisptr.get_index(), self.thisptr.get_ploidy())
-
-	def __setstate__(self, state):
-		index, ploidy = state
-		cdef vector[uint32_t] alleles = cpp.convert_index_to_alleles(index, ploidy)
-		if self.thisptr != NULL:
-			del self.thisptr
-		self.thisptr = new cpp.Genotype(alleles)
+	def __reduce__(self):
+		# __cinit__ needs the alleles, so unpickling cannot use __setstate__ alone
+		return (Genotype, (self.as_vector(),))
 
 	def __deepcopy__(self, memo):
 		return Genotype.__new__(Genotype, self.as_vector())

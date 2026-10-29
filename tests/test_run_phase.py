@@ -1041,3 +1041,49 @@ def test_paired_end_phase(tmp_path):
             VariantCallPhase(block_id=76, phase=(1, 0), quality=None),
         ],
     )
+
+
+@mark.parametrize(
+    "parameters",
+    [
+        {
+            "phase_input_files": ["tests/data/haplotag.large.bam"],
+            "variant_file": "tests/data/haplotag.large.vcf.gz",
+            "reference": False,
+        },
+        {
+            "phase_input_files": [trio_bamfile],
+            "variant_file": "tests/data/trio-two-chromosomes.vcf",
+            "ped": "tests/data/trio.ped",
+        },
+        {
+            "phase_input_files": [trio_bamfile],
+            "variant_file": "tests/data/trio-two-chromosomes.vcf",
+            "samples": ["HG002"],
+            "chromosomes": ["1"],
+            "distrust_genotypes": True,
+        },
+        {
+            "phase_input_files": [recombination_breaks_bamfile],
+            "variant_file": "tests/data/quartet.vcf.gz",
+            "ped": "tests/data/recombination_breaks.ped",
+            "recombrate": 1000000,
+        },
+    ],
+)
+def test_threads_identical_output(parameters, tmp_path):
+    outputs = []
+    for threads in (1, 3):
+        out = tmp_path / str(threads)
+        out.mkdir()
+        run_whatshap(
+            output=out / "output.vcf",
+            read_list_filename=out / "readlist.tsv",
+            recombination_list_filename=out / "recombination.tsv" if "ped" in parameters else None,
+            gtchange_list_filename=out / "gtchange.tsv",
+            threads=threads,
+            **parameters,
+        )
+        outputs.append({path.name: path.read_bytes() for path in sorted(out.iterdir())})
+    assert outputs[0] == outputs[1]
+    assert outputs[0]["output.vcf"]

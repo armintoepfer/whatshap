@@ -6,12 +6,15 @@ blocks) and phase the variants. The phased VCF is written to standard output.
 """
 
 import logging
+import multiprocessing
+import pickle
 import sys
 import platform
 
 from argparse import SUPPRESS
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
+from dataclasses import dataclass
 
 from contextlib import ExitStack
 from pathlib import Path
@@ -315,6 +318,7 @@ def run_whatshap(
     use_supplementary: bool = False,
     supplementary_distance_threshold: int = 100_000,
     algorithm: str = "whatshap",
+    threads: int = 1,
 ) -> None:
     """
     Run WhatsHap.
@@ -348,6 +352,8 @@ def run_whatshap(
     gtchange_list_filename -- filename to write list of changed genotypes to
     default_gq -- genotype likelihood to be used when GL or PL not available
     write_command_line_header -- whether to add a ##commandline header to the output VCF
+    threads -- number of worker processes that phase chromosomes in parallel (the output is
+        the same for any number)
     """
 
     if algorithm == "hapchat" and ped is not None:
@@ -455,205 +461,49 @@ def run_whatshap(
             # TODO should this be done in PhasedInputReader.__init__?
             phased_input_reader.read_vcfs()
 
-        superreads: dict[str, ReadSet]
-        components: dict
-        included_chromosomes = ChromosomeFilter(chromosomes, excluded_chromosomes)
-        for variant_table in timers.iterate("parse_vcf", vcf_reader):
-            chromosome = variant_table.chromosome
-            if chromosome not in included_chromosomes:
+        settings = PhasingSettings(
+            families=families,
+            family_trios=family_trios,
+            max_coverage=max_coverage,
+            distrust_genotypes=distrust_genotypes,
+            include_homozygous=include_homozygous,
+            read_merger=read_merger,
+            algorithm=algorithm,
+            row_limit=row_limit,
+            default_gq=default_gq,
+            gl_regularizer=gl_regularizer,
+            numeric_sample_ids=numeric_sample_ids,
+            genetic_haplotyping=genetic_haplotyping,
+            recombination_cost_computer=recombination_cost_computer,
+            keep_recombination_list=bool(recombination_list_filename),
+            keep_read_list=bool(read_list),
+        )
+
+        def write_chromosome(chromosome: str, phased: Optional[PhasedChromosome]) -> None:
+            if phased is None:
                 logger.info(
                     "Leaving chromosome %r unchanged "
                     "(present in VCF but not requested by --chromosome)",
                     chromosome,
                 )
                 with timers("write_vcf"):
-                    superreads, components = {}, {}
-                    vcf_writer.write(chromosome, superreads, components)
-                continue
+                    vcf_writer.write(chromosome, {}, {})
+                return
 
-            # These two variables hold the phasing results for all samples
-            superreads, components = {}, {}
-
-            # Iterate over all families to process, i.e. a separate DP table is created
-            # for each family.
-            # TODO: Can the body of this loop be factored out into a phase_family function?
-            for representative_sample, family in sorted(families.items()):
-                logger.info("")
-                if len(family) == 1:
-                    logger.info(
-                        "# Working on contig %s in individual %s", chromosome, representative_sample
-                    )
-                else:
-                    logger.info(
-                        "# Working on contig %s in family individuals %s",
-                        chromosome,
-                        ",".join(family),
-                    )
-                max_coverage_per_sample = max(1, max_coverage // len(family))
-                logger.debug("Using maximum coverage per sample of %dX", max_coverage_per_sample)
-                trios = family_trios[representative_sample]
-                assert len(family) == 1 or len(trios) > 0
-
-                homozygous_positions, phasable_variant_table = find_phaseable_variants(
-                    family, include_homozygous, trios, variant_table
-                )
-
-                # Get the reads belonging to each sample
-                readsets = {}  # TODO this could become a list
-                for sample in family:
-                    with timers("read_bam"):
-                        readset, vcf_source_ids = phased_input_reader.read(
-                            chromosome, phasable_variant_table.variants, sample
-                        )
-
-                    # TODO: Read selection done w.r.t. all variants, where using heterozygous
-                    #  variants only would probably give better results.
-                    with timers("select"):
-                        readset = readset.subset(
-                            [i for i, read in enumerate(readset) if len(read) >= 2]
-                        )
-                        logger.info(
-                            "Kept %d reads that cover at least two variants each", len(readset)
-                        )
-                        merged_reads = read_merger.merge(readset)
-                        if algorithm == "heuristic":
-                            selected_reads = merged_reads
-                        else:
-                            selected_reads = select_reads(
-                                merged_reads,
-                                max_coverage_per_sample,
-                                preferred_source_ids=vcf_source_ids,
-                            )
-
-                    readsets[sample] = selected_reads
-                    if len(family) == 1 and not distrust_genotypes:
-                        # When having a pedigree (len(family) > 1), blocks are also merged after
-                        # phasing based on the pedigree information and these statistics are not
-                        # so useful. When distrust_genotypes, genotypes can change during phasing
-                        # and so can the block structure. So don't print these stats in those cases
-                        log_best_case_phasing_info(readset, selected_reads)
-
-                all_reads = merge_readsets(readsets)
-
-                # Determine which variants can (in principle) be phased
-                accessible_positions = sorted(all_reads.get_positions())
-                logger.debug(
-                    "Variants covered by at least one phase-informative "
-                    "read in at least one individual after read selection: %d",
-                    len(accessible_positions),
-                )
-                if len(family) > 1 and genetic_haplotyping:
-                    # In case of genetic haplotyping, also retain all positions homozygous
-                    # in at least one individual (because they might be phased based on genotypes)
-                    accessible_positions = sorted(
-                        set(accessible_positions).union(homozygous_positions)
-                    )
-                    logger.info(
-                        "Variants either covered by phase-informative read or homozygous "
-                        "in at least one individual: %d",
-                        len(accessible_positions),
-                    )
-
-                # Keep only accessible positions
-                phasable_variant_table.subset_rows_by_position(accessible_positions)
-                assert len(phasable_variant_table.variants) == len(accessible_positions)
-
-                pedigree = create_pedigree(
-                    default_gq,
-                    distrust_genotypes,
-                    family,
-                    gl_regularizer,
-                    numeric_sample_ids,
-                    phasable_variant_table,
-                    trios,
-                )
-                recombination_costs = recombination_cost_computer.compute(accessible_positions)
-
-                # Finally, run phasing algorithm
-                with timers("phase"):
-                    problem_name = "MEC" if len(family) == 1 else "PedMEC"
-                    logger.info(
-                        "Phasing %d sample%s by solving the %s problem ...",
-                        len(family),
-                        plural_s(len(family)),
-                        problem_name,
-                    )
-
-                    dp_table: PhasingAlgorithm
-                    if algorithm == "hapchat":
-                        dp_table = HapChatCore(all_reads)
-                    elif algorithm == "heuristic":
-                        all_reads.sort()
-                        dp_table = PedMecHeuristic(
-                            all_reads,
-                            recombination_costs,
-                            pedigree,
-                            row_limit,
-                            distrust_genotypes=distrust_genotypes,
-                            positions=accessible_positions,
-                            allow_mutations=True,
-                            verbosity=0,
-                        )
-                    else:
-                        dp_table = PedigreeDPTable(
-                            all_reads,
-                            recombination_costs,
-                            pedigree,
-                            distrust_genotypes,
-                            accessible_positions,
-                        )
-                    superreads_list, transmission_vector = dp_table.get_super_reads()
-                    logger.debug("%s cost: %d", problem_name, dp_table.get_optimal_cost())
-
-                with timers("components"):
-                    overall_components = compute_overall_components(
-                        accessible_positions,
-                        all_reads,
-                        distrust_genotypes,
-                        family,
-                        genetic_haplotyping,
-                        homozygous_positions,
-                        numeric_sample_ids,
-                        superreads_list,
-                    )
-                    log_component_stats(overall_components, len(accessible_positions))
-
-                if recombination_list_filename:
-                    assert transmission_vector is not None
+            for family_output in phased.family_outputs:
+                if family_output.recombination is not None:
                     n_recombinations = write_recombination_list(
-                        recombination_list_filename,
-                        chromosome,
-                        accessible_positions,
-                        overall_components,
-                        recombination_costs,
-                        transmission_vector,
-                        trios,
+                        recombination_list_filename, chromosome, *family_output.recombination
                     )
                     logger.info("Total no. of detected recombination events: %d", n_recombinations)
-
-                # Superreads in superreads_list are in the same order as individuals were added to the pedigree
-                for sample, sample_superreads in zip(family, superreads_list):
-                    superreads[sample] = sample_superreads
-                    assert len(sample_superreads) == 2
-                    assert (
-                        sample_superreads[0].sample_id
-                        == sample_superreads[1].sample_id
-                        == numeric_sample_ids[sample]
-                    )
-                    # identical for all samples
-                    components[sample] = overall_components
-
-                if read_list:
-                    read_list.write(
-                        all_reads,
-                        dp_table.get_optimal_partitioning(),
-                        components,
-                        numeric_sample_ids,
-                    )
+                if family_output.read_list is not None:
+                    read_list.write(*family_output.read_list, numeric_sample_ids)
 
             with timers("write_vcf"):
                 logger.debug("Writing phasing result to output VCF")
-                changed_genotypes = vcf_writer.write(chromosome, superreads, components)
+                changed_genotypes = vcf_writer.write(
+                    chromosome, phased.superreads, phased.components
+                )
                 if changed_genotypes:
                     assert distrust_genotypes
                     logger.info("Changed %d genotypes while writing VCF", len(changed_genotypes))
@@ -664,7 +514,368 @@ def run_whatshap(
 
             logger.debug("Chromosome %r finished", chromosome)
 
-    log_time_and_memory_usage(timers, show_phase_vcfs=show_phase_vcfs)
+        included_chromosomes = ChromosomeFilter(chromosomes, excluded_chromosomes)
+        if threads == 1:
+            for variant_table in timers.iterate("parse_vcf", vcf_reader):
+                chromosome = variant_table.chromosome
+                if chromosome not in included_chromosomes:
+                    write_chromosome(chromosome, None)
+                    continue
+                write_chromosome(
+                    chromosome,
+                    phase_chromosome(variant_table, settings, phased_input_reader, timers),
+                )
+        else:
+            # Assign the numeric sample ids in the order in which the first chromosome
+            # would assign them, so that the worker processes get the same ids
+            for _, family in sorted(families.items()):
+                for sample in family:
+                    _ = numeric_sample_ids[sample]
+            reader_arguments = {
+                "bam_or_vcf_paths": phase_input_files,
+                "reference": None if reference is False else reference,
+                "numeric_sample_ids": numeric_sample_ids,
+                "ignore_read_groups": ignore_read_groups,
+                "mapq_threshold": mapping_quality,
+                "only_snvs": only_snvs,
+                "use_supplementary": use_supplementary,
+                "supplementary_distance_threshold": supplementary_distance_threshold,
+            }
+            phase_chromosomes_in_parallel(
+                vcf_reader,
+                included_chromosomes,
+                write_chromosome,
+                settings,
+                reader_arguments,
+                threads,
+                timers,
+            )
+
+    log_time_and_memory_usage(timers, show_phase_vcfs=show_phase_vcfs, threads=threads)
+
+
+@dataclass
+class PhasingSettings:
+    """The settings of phase_chromosome (picklable, for the worker processes of --threads)"""
+
+    families: Mapping[str, Sequence[str]]
+    family_trios: Mapping[str, Sequence[Trio]]
+    max_coverage: int
+    distrust_genotypes: bool
+    include_homozygous: bool
+    read_merger: ReadMergerBase
+    algorithm: str
+    row_limit: int
+    default_gq: int
+    gl_regularizer: Optional[float]
+    numeric_sample_ids: NumericSampleIds
+    genetic_haplotyping: bool
+    recombination_cost_computer: RecombinationCostComputer
+    keep_recombination_list: bool
+    keep_read_list: bool
+
+
+@dataclass
+class FamilyOutput:
+    """What is written for one family to the --recombination-list and --output-read-list files"""
+
+    # arguments of write_recombination_list after the chromosome
+    recombination: Optional[tuple] = None
+    # arguments of ReadList.write before numeric_sample_ids
+    read_list: Optional[tuple] = None
+
+
+@dataclass
+class PhasedChromosome:
+    superreads: dict[str, ReadSet]
+    components: dict[str, Mapping[int, int]]
+    family_outputs: list[FamilyOutput]
+
+
+def phase_chromosome(
+    variant_table: VariantTable,
+    settings: PhasingSettings,
+    phased_input_reader: PhasedInputReader,
+    timers: StageTimer,
+) -> PhasedChromosome:
+    """Phase all families on one chromosome"""
+    chromosome = variant_table.chromosome
+    # These two variables hold the phasing results for all samples
+    superreads: dict[str, ReadSet] = {}
+    components: dict[str, Mapping[int, int]] = {}
+    family_outputs: list[FamilyOutput] = []
+
+    # Iterate over all families to process, i.e. a separate DP table is created
+    # for each family.
+    for representative_sample, family in sorted(settings.families.items()):
+        logger.info("")
+        if len(family) == 1:
+            logger.info(
+                "# Working on contig %s in individual %s", chromosome, representative_sample
+            )
+        else:
+            logger.info(
+                "# Working on contig %s in family individuals %s",
+                chromosome,
+                ",".join(family),
+            )
+        max_coverage_per_sample = max(1, settings.max_coverage // len(family))
+        logger.debug("Using maximum coverage per sample of %dX", max_coverage_per_sample)
+        trios = settings.family_trios[representative_sample]
+        assert len(family) == 1 or len(trios) > 0
+
+        homozygous_positions, phasable_variant_table = find_phaseable_variants(
+            family, settings.include_homozygous, trios, variant_table
+        )
+
+        # Get the reads belonging to each sample
+        readsets = {}  # TODO this could become a list
+        for sample in family:
+            with timers("read_bam"):
+                readset, vcf_source_ids = phased_input_reader.read(
+                    chromosome, phasable_variant_table.variants, sample
+                )
+
+            # TODO: Read selection done w.r.t. all variants, where using heterozygous
+            #  variants only would probably give better results.
+            with timers("select"):
+                readset = readset.subset([i for i, read in enumerate(readset) if len(read) >= 2])
+                logger.info("Kept %d reads that cover at least two variants each", len(readset))
+                merged_reads = settings.read_merger.merge(readset)
+                if settings.algorithm == "heuristic":
+                    selected_reads = merged_reads
+                else:
+                    selected_reads = select_reads(
+                        merged_reads,
+                        max_coverage_per_sample,
+                        preferred_source_ids=vcf_source_ids,
+                    )
+
+            readsets[sample] = selected_reads
+            if len(family) == 1 and not settings.distrust_genotypes:
+                # When having a pedigree (len(family) > 1), blocks are also merged after
+                # phasing based on the pedigree information and these statistics are not
+                # so useful. When distrust_genotypes, genotypes can change during phasing
+                # and so can the block structure. So don't print these stats in those cases
+                log_best_case_phasing_info(readset, selected_reads)
+
+        all_reads = merge_readsets(readsets)
+
+        # Determine which variants can (in principle) be phased
+        accessible_positions = sorted(all_reads.get_positions())
+        logger.debug(
+            "Variants covered by at least one phase-informative "
+            "read in at least one individual after read selection: %d",
+            len(accessible_positions),
+        )
+        if len(family) > 1 and settings.genetic_haplotyping:
+            # In case of genetic haplotyping, also retain all positions homozygous
+            # in at least one individual (because they might be phased based on genotypes)
+            accessible_positions = sorted(set(accessible_positions).union(homozygous_positions))
+            logger.info(
+                "Variants either covered by phase-informative read or homozygous "
+                "in at least one individual: %d",
+                len(accessible_positions),
+            )
+
+        # Keep only accessible positions
+        phasable_variant_table.subset_rows_by_position(accessible_positions)
+        assert len(phasable_variant_table.variants) == len(accessible_positions)
+
+        pedigree = create_pedigree(
+            settings.default_gq,
+            settings.distrust_genotypes,
+            family,
+            settings.gl_regularizer,
+            settings.numeric_sample_ids,
+            phasable_variant_table,
+            trios,
+        )
+        recombination_costs = settings.recombination_cost_computer.compute(accessible_positions)
+
+        # Finally, run phasing algorithm
+        with timers("phase"):
+            problem_name = "MEC" if len(family) == 1 else "PedMEC"
+            logger.info(
+                "Phasing %d sample%s by solving the %s problem ...",
+                len(family),
+                plural_s(len(family)),
+                problem_name,
+            )
+
+            dp_table: PhasingAlgorithm
+            if settings.algorithm == "hapchat":
+                dp_table = HapChatCore(all_reads)
+            elif settings.algorithm == "heuristic":
+                all_reads.sort()
+                dp_table = PedMecHeuristic(
+                    all_reads,
+                    recombination_costs,
+                    pedigree,
+                    settings.row_limit,
+                    distrust_genotypes=settings.distrust_genotypes,
+                    positions=accessible_positions,
+                    allow_mutations=True,
+                    verbosity=0,
+                )
+            else:
+                dp_table = PedigreeDPTable(
+                    all_reads,
+                    recombination_costs,
+                    pedigree,
+                    settings.distrust_genotypes,
+                    accessible_positions,
+                )
+            superreads_list, transmission_vector = dp_table.get_super_reads()
+            logger.debug("%s cost: %d", problem_name, dp_table.get_optimal_cost())
+
+        with timers("components"):
+            overall_components = compute_overall_components(
+                accessible_positions,
+                all_reads,
+                settings.distrust_genotypes,
+                family,
+                settings.genetic_haplotyping,
+                homozygous_positions,
+                settings.numeric_sample_ids,
+                superreads_list,
+            )
+            log_component_stats(overall_components, len(accessible_positions))
+
+        family_output = FamilyOutput()
+        if settings.keep_recombination_list:
+            assert transmission_vector is not None
+            family_output.recombination = (
+                accessible_positions,
+                overall_components,
+                recombination_costs,
+                transmission_vector,
+                trios,
+            )
+
+        # Superreads in superreads_list are in the same order as individuals were added to the pedigree
+        for sample, sample_superreads in zip(family, superreads_list):
+            superreads[sample] = sample_superreads
+            assert len(sample_superreads) == 2
+            assert (
+                sample_superreads[0].sample_id
+                == sample_superreads[1].sample_id
+                == settings.numeric_sample_ids[sample]
+            )
+            # identical for all samples
+            components[sample] = overall_components
+
+        if settings.keep_read_list:
+            family_output.read_list = (
+                all_reads,
+                dp_table.get_optimal_partitioning(),
+                dict(components),
+            )
+        family_outputs.append(family_output)
+    return PhasedChromosome(superreads, components, family_outputs)
+
+
+class _LogRecordCollector(logging.Handler):
+    """Keep the log records of a worker process, to be emitted by the main process"""
+
+    def __init__(self):
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        # Make the record picklable
+        record.msg = record.getMessage()
+        record.args = None
+        if record.exc_info:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+            record.exc_info = None
+        self.records.append(record)
+
+
+# The state of a worker process of phase_chromosomes_in_parallel
+_worker_state: dict = {}
+
+
+def _init_worker(settings: PhasingSettings, reader_arguments: dict, log_level: int) -> None:
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    collector = _LogRecordCollector()
+    root.addHandler(collector)
+    root.setLevel(log_level)
+    # The reader stays open for the life of the worker process
+    phased_input_reader = PhasedInputReader(**reader_arguments)
+    phased_input_reader.read_vcfs()
+    _worker_state.update(
+        settings=settings, phased_input_reader=phased_input_reader, collector=collector
+    )
+
+
+def _phase_chromosome_in_worker(pickled_variant_table: bytes):
+    # The task is unpickled here and not by multiprocessing, so that an error
+    # reaches the main process (instead of a worker that ends and a pool that waits)
+    variant_table = pickle.loads(pickled_variant_table)
+    collector = _worker_state["collector"]
+    collector.records = []
+    timers = StageTimer()
+    phased = phase_chromosome(
+        variant_table, _worker_state["settings"], _worker_state["phased_input_reader"], timers
+    )
+    return phased, collector.records, timers.stages()
+
+
+def phase_chromosomes_in_parallel(
+    vcf_reader: VcfReader,
+    included_chromosomes: ChromosomeFilter,
+    write_chromosome,
+    settings: PhasingSettings,
+    reader_arguments: dict,
+    threads: int,
+    timers: StageTimer,
+) -> None:
+    """
+    Phase the chromosomes of vcf_reader in worker processes and write them in the order
+    of the input VCF, with write_chromosome. The log messages of a chromosome are emitted
+    before it is written, in the same order as without worker processes.
+    """
+
+    def write_next():
+        chromosome, async_result = pending.popleft()
+        if async_result is None:
+            write_chromosome(chromosome, None)
+            return
+        phased, records, stages = async_result.get()
+        for record in records:
+            logging.getLogger(record.name).handle(record)
+        timers.add(stages)
+        write_chromosome(chromosome, phased)
+
+    log_level = logging.getLogger().getEffectiveLevel()
+    with multiprocessing.Pool(
+        threads, initializer=_init_worker, initargs=(settings, reader_arguments, log_level)
+    ) as pool:
+        # (chromosome, AsyncResult or None if the chromosome is not phased), in VCF order
+        pending: deque = deque()
+        for variant_table in timers.iterate("parse_vcf", vcf_reader):
+            chromosome = variant_table.chromosome
+            if chromosome in included_chromosomes:
+                pending.append(
+                    (
+                        chromosome,
+                        pool.apply_async(
+                            _phase_chromosome_in_worker, (pickle.dumps(variant_table),)
+                        ),
+                    )
+                )
+            else:
+                pending.append((chromosome, None))
+            # Write what is done; keep at most as many chromosomes in work as there are workers
+            while pending and (
+                pending[0][1] is None or pending[0][1].ready() or len(pending) > threads
+            ):
+                write_next()
+        while pending:
+            write_next()
 
 
 def compute_overall_components(
@@ -864,10 +1075,16 @@ def find_phaseable_variants(
     return homozygous_positions, phasable_variant_table
 
 
-def log_time_and_memory_usage(timers, show_phase_vcfs):
+def log_time_and_memory_usage(timers, show_phase_vcfs, threads=1):
     total_time = timers.total()
     logger.info("\n# Resource usage")
-    log_memory_usage()
+    log_memory_usage(include_children=(threads > 1))
+    if threads > 1:
+        logger.info(
+            "Reading BAM/CRAM, selecting reads, phasing and finding components: "
+            "sum of the times of %d worker processes",
+            threads,
+        )
     # fmt: off
     logger.info("Time spent reading BAM/CRAM:                 %6.1f s", timers.elapsed("read_bam"))
     logger.info("Time spent parsing VCF:                      %6.1f s", timers.elapsed("parse_vcf"))
@@ -877,7 +1094,8 @@ def log_time_and_memory_usage(timers, show_phase_vcfs):
     logger.info("Time spent phasing:                          %6.1f s", timers.elapsed("phase"))
     logger.info("Time spent writing VCF:                      %6.1f s", timers.elapsed("write_vcf"))
     logger.info("Time spent finding components:               %6.1f s", timers.elapsed("components"))
-    logger.info("Time spent on rest:                          %6.1f s", total_time - timers.sum())
+    if threads == 1:
+        logger.info("Time spent on rest:                          %6.1f s", total_time - timers.sum())
     logger.info("Total elapsed time:                          %6.1f s", total_time)
     # fmt: on
 
@@ -1044,6 +1262,9 @@ def add_arguments(parser):
         "HP tag (used by GATK ReadBackedPhasing) (default: %(default)s)")
     arg("--output-read-list", metavar="FILE", default=None, dest="read_list_filename",
         help="Write reads that have been used for phasing to FILE.")
+    arg("--threads", type=int, default=1,
+        help="Number of worker processes that phase chromosomes in parallel. "
+        "The output is the same for any number. Default: %(default)s")
     arg("--algorithm", choices=("whatshap", "hapchat", "heuristic"), default="whatshap",
         help="Phasing algorithm to use (default: %(default)s)")
 
@@ -1153,6 +1374,8 @@ def add_arguments(parser):
 
 
 def validate(args, parser):
+    if args.threads < 1:
+        parser.error("Option --threads must be at least 1")
     if args.reference is not None and args.no_reference:
         parser.error("Options --reference and --no-reference cannot be used together")
     if args.ignore_read_groups and args.ped:

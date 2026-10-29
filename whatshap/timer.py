@@ -3,7 +3,7 @@ import logging
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import TypeVar
-from collections.abc import Iterator, Iterable
+from collections.abc import Iterator, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,15 @@ class StageTimer:
         its current invocation is not counted.
         """
         return self._elapsed[stage]
+
+    def stages(self) -> dict[str, float]:
+        """Return the time spent in each stage"""
+        return dict(self._elapsed)
+
+    def add(self, stages: Mapping[str, float]) -> None:
+        """Add the times of stages (for example of another StageTimer)"""
+        for stage, elapsed in stages.items():
+            self._elapsed[stage] += elapsed
 
     def sum(self) -> float:
         """Return sum of all times"""

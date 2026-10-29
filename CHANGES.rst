@@ -15,6 +15,9 @@ development version
 * Faster read selection (28% less time; the selected reads are the same).
 * Faster allele detection by realignment (the default; not with
   ``--use-kmerald`` or affine gap costs): 10% less time to read the alignments.
+* ``phase``: New option ``--threads``: worker processes phase the chromosomes in
+  parallel. The output is the same for any number of threads. A human 30x HiFi
+  sample takes 185 s with ``--threads 21``.
 
 v2.8 (2025-06-08)
 -----------------
