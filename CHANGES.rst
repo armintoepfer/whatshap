@@ -13,6 +13,11 @@ development version
   The result is identical. On a human 30x HiFi sample, the DP takes 33 times
   less time. With the changes below, ``phase`` on the whole genome takes 4.7
   times less time (6983 s to 1496 s) and 22% less memory.
+* ``phase``: Faster DP for pedigrees (``--ped``) and for ``--distrust-genotypes``.
+  The result is identical. HiFi trio HG002/HG003/HG004, chromosomes 1 and 21:
+  the DP takes 9.6 times less time, ``phase`` 4.4 times less (1349 s to 308 s)
+  and 21% less memory. On chromosome 22, ``--distrust-genotypes`` takes 8 times
+  less time for the trio and 3.8 times less for one sample.
 * Faster read selection (28% less time; the selected reads are the same).
 * Faster allele detection by realignment (the default; not with
   ``--use-kmerald`` or affine gap costs): 10% less time to read the alignments.
