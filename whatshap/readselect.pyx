@@ -4,11 +4,11 @@ import math
 import logging
 from collections import defaultdict
 
-from .coverage import CovMonitor
 from .graph import ComponentFinder
 from .priorityqueue import PriorityQueue
 
 from libcpp.unordered_set cimport unordered_set
+from libcpp.vector cimport vector
 
 from .priorityqueue cimport priority_type, priority_type_ptr, queue_entry_type, PriorityQueue
 from .core cimport ReadSet
@@ -32,6 +32,29 @@ def _construct_indexes(readset, preferred_source_ids=None):
 			variant_index = vcf_indices[variant.position]
 			variant_to_reads_map[variant_index].append(index)
 	return positions, vcf_indices, variant_to_reads_map, preferred_reads
+
+
+cdef class CovMonitor:
+	'''The number of selected reads that cover each variant (by index), between the first and the
+	last variant of each read.'''
+	cdef vector[int] coverage
+
+	def __init__(self, int length):
+		self.coverage.assign(length, 0)
+
+	cpdef int max_coverage_in_range(self, int begin, int end):
+		assert begin < end
+		cdef int result = self.coverage[begin]
+		cdef int i
+		for i in range(begin + 1, end):
+			if self.coverage[i] > result:
+				result = self.coverage[i]
+		return result
+
+	cpdef add_read(self, int begin, int end):
+		cdef int i
+		for i in range(begin, end):
+			self.coverage[i] += 1
 
 
 cdef priority_type_ptr _update_score_for_reads(priority_type_ptr former_score, cpp.ReadSet* readset, index, unordered_set[int]& already_covered_variants):
@@ -104,7 +127,7 @@ cdef PriorityQueue _construct_priorityqueue(cpp.ReadSet* readset, read_indices, 
 	return priorityqueue
 
 
-cdef _slice_read_selection(PriorityQueue pq, coverages, max_cov, cpp.ReadSet* readset, vcf_indices, variant_to_reads_map):
+cdef _slice_read_selection(PriorityQueue pq, CovMonitor coverages, int max_cov, cpp.ReadSet* readset, vcf_indices, variant_to_reads_map):
 	'''Extraction of a set of read indices, where each variant should be covered at least once, if coverage, or reads are allowing it '''
 	# positions of variants covered by any read selected so far
 	already_covered_variants = set()
@@ -154,9 +177,7 @@ cdef _slice_read_selection(PriorityQueue pq, coverages, max_cov, cpp.ReadSet* re
 				reads_whose_score_has_to_be_updated.update(variant_to_reads_map[vcf_indices.get(pos)])
 
 			#find difference between to_decrease_score and selected_reads in order to not to try to decrease score by selected reads
-			selected_read_set = set(reads_in_slice)
-			decrease_set = reads_whose_score_has_to_be_updated
-			d_set = decrease_set.difference(selected_read_set)
+			d_set = reads_whose_score_has_to_be_updated.difference(reads_in_slice)
 
 			#Catch with None if element is not in the priorityqueue
 			for element in d_set:
@@ -181,7 +202,7 @@ cdef format_read_source_stats(cpp.ReadSet* readset, indices):
 	return ', '.join('{}:{}'.format(source_id, count) for source_id, count in source_id_counts.items())
 
 
-cdef readselection_helper(coverages, max_cov, cpp.ReadSet* readset, vcf_indices, variant_to_reads_map, selected_reads, undecided_reads, positions, bridging):
+cdef readselection_helper(CovMonitor coverages, int max_cov, cpp.ReadSet* readset, vcf_indices, variant_to_reads_map, selected_reads, undecided_reads, positions, bridging):
 	cdef PriorityQueue pq
 	cdef cpp.Read* read
 	loop = 0

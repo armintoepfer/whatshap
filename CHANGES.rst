@@ -12,6 +12,7 @@ development version
   (no pedigree) whose genotypes are trusted (no ``--distrust-genotypes``).
   The result is identical. On a human 30x HiFi sample, the DP takes 33 times
   less time (``phase`` in total 2.7 times less) and slightly less memory.
+* Faster read selection (28% less time; the selected reads are the same).
 
 v2.8 (2025-06-08)
 -----------------
