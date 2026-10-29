@@ -538,3 +538,35 @@ def test_vcf_without_index(tmp_path):
     shutil.copy("tests/data/haplotag_1.vcf.gz", vcf_path)
     with raises(VcfIndexMissing), VcfReader(vcf_path) as vr:
         list(vr.fetch("chr1"))
+
+
+def variant_table_rows(table):
+    return (
+        table.chromosome,
+        table.samples,
+        [(v.position, v.reference_allele, v.alternative_allele) for v in table.variants],
+        [[gt.as_vector() for gt in column] for column in table.genotypes],
+        table.allele_depths,
+        table.phases,
+        [
+            [None if gl is None else gl.log10_probs() for gl in column]
+            for column in table.genotype_likelihoods
+        ],
+    )
+
+
+def test_subset_and_remove_rows_by_index():
+    from copy import deepcopy
+
+    for path, kwargs in [
+        ("tests/data/genotype-likelihoods.vcf", {"genotype_likelihoods": True}),
+        ("tests/data/phasedinput.vcf", {"phases": True}),
+    ]:
+        for table in VcfReader(path, **kwargs):
+            for indices in [[], [0], list(range(len(table))), list(range(0, len(table), 2))]:
+                expected = deepcopy(table)
+                expected.remove_rows_by_index(set(range(len(table))).difference(indices))
+                subset = table.subset_rows_by_index(reversed(indices))
+                assert variant_table_rows(subset) == variant_table_rows(expected)
+                assert len(subset) == len(indices)
+                assert subset.genotypes_of(table.samples[0]) is subset.genotypes[0]

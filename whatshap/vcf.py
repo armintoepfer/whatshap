@@ -380,16 +380,15 @@ class VariantTable:
 
     def remove_rows_by_index(self, indices: Iterable[int]) -> None:
         """Remove variants given by their index in the variant list"""
-        for i in sorted(indices, reverse=True):
-            del self.variants[i]
-            for gt in self.genotypes:
-                del gt[i]
-            for ad in self.allele_depths:
-                del ad[i]
-            for ph in self.phases:
-                del ph[i]
-            for gl in self.genotype_likelihoods:
-                del gl[i]
+        to_remove = frozenset(indices)
+        if not to_remove:
+            return
+        keep = [i for i in range(len(self.variants)) if i not in to_remove]
+        # change the lists in place: callers can hold a list of this table (genotypes_of etc.)
+        for column in [self.variants, *self.genotypes, *self.allele_depths, *self.phases]:
+            column[:] = [column[i] for i in keep]
+        for gl in self.genotype_likelihoods:
+            gl[:] = [gl[i] for i in keep]
 
         for gt in self.genotypes:
             assert len(self.variants) == len(gt)
@@ -403,6 +402,24 @@ class VariantTable:
             == len(self.phases)
             == len(self.genotype_likelihoods)
         )
+
+    def subset_rows_by_index(self, indices: Iterable[int]) -> "VariantTable":
+        """
+        Return a new table with the rows given by their index, in the order of this table.
+        The new table has its own lists, but it shares the variant, genotype, phase and
+        genotype likelihood objects with this table.
+        """
+        keep = sorted(set(indices))
+        table = VariantTable(self.chromosome, list(self.samples))
+        table.variants = [self.variants[i] for i in keep]
+        for column, source in [
+            (table.genotypes, self.genotypes),
+            (table.allele_depths, self.allele_depths),
+            (table.phases, self.phases),
+            (table.genotype_likelihoods, self.genotype_likelihoods),
+        ]:
+            column[:] = [[values[i] for i in keep] for values in source]
+        return table
 
     def subset_rows_by_position(self, positions: Iterable[int]) -> None:
         """Keep only rows given in positions, discard the rest"""

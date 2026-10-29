@@ -13,7 +13,6 @@ import platform
 from argparse import SUPPRESS
 from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from copy import deepcopy
 from dataclasses import dataclass
 
 from contextlib import ExitStack
@@ -1048,17 +1047,14 @@ def find_phaseable_variants(
     else:
         to_retain = heterozygous
     to_retain = to_retain.difference(missing_genotypes).difference(mendelian_conflicts)
-    # discard every variant that is not to be retained
-    to_discard = set(range(len(variant_table))).difference(to_retain)
     # Determine positions of selected variants that are homozygous in at least one individual.
     # These are used later to merge blocks containing these variants into one block (since
     # they are connected by "genetic haplotyping").
     homozygous_positions = [
         variant_table.variants[i].position for i in to_retain.intersection(homozygous)
     ]
-    phasable_variant_table = deepcopy(variant_table)
-    # Remove calls to be discarded from variant table
-    phasable_variant_table.remove_rows_by_index(to_discard)
+    # keep only the variants to be retained (the new table shares the rows of variant_table)
+    phasable_variant_table = variant_table.subset_rows_by_index(to_retain)
 
     if len(family) == 1:
         logger.info(
